@@ -17,6 +17,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -31,16 +32,33 @@ HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
+# Ключевые слова для поиска страниц
+CONTACT_KEYWORDS = [
+    "contact", "contacts", "kontakt", "kontakty", "kontakti", "kontaktai",
+    "about", "o-kompanii", "o-nas", "company", "about-us", "about_us",
+    "company/contacts", "company/contact", "about/contacts", "en/contacts",
+    "ru/contacts", "contacts.html", "contact.html", "kontakty.html",
+]
+
+VACANCY_KEYWORDS = [
+    "vacancies", "vacancy", "career", "careers", "jobs", "job", "work",
+    "hr", "human-resources", "recruitment", "recruiting", "talent",
+    "join", "join-us", "join_us", "team", "rabota", "vakansii",
+    "vacancy.html", "career.html", "jobs.html", "hr.html",
+]
+
+OTHER_KEYWORDS = [
+    "press", "media", "pr", "news", "investors", "partners", "suppliers",
+]
+
 
 def extract_emails(text: str) -> list:
-    """Извлекает email из текста."""
     if not text:
         return []
     return list(set(EMAIL_REGEX.findall(text)))
 
 
 def fetch_url(url: str, retries: int = 2) -> str | None:
-    """Загружает страницу с повторными попытками."""
     for attempt in range(retries + 1):
         try:
             response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
@@ -51,8 +69,8 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
                 time.sleep(2)
                 continue
             return None
-        except requests.exceptions.HTTPError as e:
-            if response.status_code == 403:
+        except requests.exceptions.HTTPError:
+            if response.status_code in (403, 429, 503):
                 return "BLOCKED"
             return None
         except Exception:
@@ -60,36 +78,110 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
     return None
 
 
-def find_contact_links(base_url: str, html: str) -> list:
-    """Ищет ссылки на страницы контактов."""
+def find_links_by_keywords(base_url: str, html: str, keywords: list) -> list:
+    """Ищет ссылки по ключевым словам."""
     if not html or html == "BLOCKED":
         return []
     
     links = set()
-    keywords = [
-        "contact", "contacts", "kontakt", "kontakty", "kontakti",
-        "about", "o-kompanii", "o-nas", "company",
-        "company/contacts", "company/contact", "about/contacts",
-        "en/contacts", "ru/contacts", "contacts.html", "contact.html",
-        "kontakty.html", "kontakt.html", "about-us", "about_us",
-    ]
-    
-    # Ищем через регулярку (быстрее, чем BeautifulSoup)
-    href_pattern = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
-    hrefs = href_pattern.findall(html)
+    hrefs = HREF_REGEX.findall(html)
     
     for href in hrefs:
         href_lower = href.lower()
         if any(k in href_lower for k in keywords):
             full_url = urljoin(base_url, href)
-            links.add(full_url)
+            # Оставляем только ссылки того же домена
+            if urlparse(full_url).netloc.replace("www.", "") == urlparse(base_url).netloc.replace("www.", ""):
+                links.add(full_url)
     
-    # Также ищем JSON-LD и meta-теги с email
     return list(links)
 
 
+def classify_email(email: str) -> str:
+    """Классифицирует email по типу."""
+    lower = email.lower()
+    
+    hr_patterns = [
+        "hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@",
+        "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@",
+        "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@",
+        "hr.", "career.", "recruit.", "job.", "vacancy.", "work.",
+    ]
+    
+    leadership_patterns = [
+        "ceo@", "director@", "chief@", "president@", "manager@", "head@",
+        "founder@", "owner@", "md@", "dir@", "managing@", "executive@",
+        "lead@", "boss@", "supervisor@", "руководство@", "директор@",
+        "гендиректор@", "prezes@", "direktor@", "leiter@",
+    ]
+    
+    sales_patterns = [
+        "sales@", "marketing@", "bizdev@", "business@", "commercial@",
+        "commerce@", "trade@", "dealer@", "distrib@", "partner@", "b2b@",
+        "client@", "customers@", "zakaz@", "prodaza@", "zakupki@",
+    ]
+    
+    general_patterns = [
+        "info@", "office@", "contact@", "contacts@", "support@", "admin@",
+        "help@", "service@", "reception@", "general@", "mail@", "post@",
+        "press@", "media@", "pr@", "secretary@", "secretariat@",
+    ]
+    
+    if any(p in lower for p in hr_patterns):
+        return "👤 HR / Найм"
+    if any(p in lower for p in leadership_patterns):
+        return "👔 Руководство"
+    if any(p in lower for p in sales_patterns):
+        return "💼 Продажи / Бизнес"
+    if any(p in lower for p in general_patterns):
+        return "🏢 Общий"
+    
+    return "❓ Другой"
+
+
+def is_junk_email(email: str) -> bool:
+    """Фильтрует мусорные и технические email."""
+    lower = email.lower()
+    
+    junk_domains = [
+        "example.com", "test.com", "domain.com", "email.com", "yourdomain.com",
+        "localhost", "site.com", "company.com", "mail.ru", "yandex.ru",
+    ]
+    
+    junk_prefixes = [
+        "no-reply", "noreply", "donotreply", "robot", "autoreply",
+        "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster",
+        "postmaster", "webmaster", "root", "administrator", "security",
+        "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@",
+    ]
+    
+    if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
+        return True
+    
+    if any(lower.startswith(p) for p in junk_prefixes):
+        return True
+    
+    return False
+
+
+def search_email_in_html(html: str) -> list:
+    """Ищет email в HTML, включая обфусцированные."""
+    emails = extract_emails(html)
+    
+    # Обфусцированные: name [at] domain [dot] com
+    obf1 = re.findall(r'([a-zA-Z0-9._%+-]+)\s*\[at\]\s*([a-zA-Z0-9.-]+)\s*\[dot\]\s*([a-zA-Z]{2,})', html)
+    for m in obf1:
+        emails.append(f"{m[0]}@{m[1]}.{m[2]}")
+    
+    # Обфусцированные: name(at)domain(dot)com
+    obf2 = re.findall(r'([a-zA-Z0-9._%+-]+)\(at\)([a-zA-Z0-9.-]+)\(dot\)([a-zA-Z]{2,})', html)
+    for m in obf2:
+        emails.append(f"{m[0]}@{m[1]}.{m[2]}")
+    
+    return list(set(emails))
+
+
 def get_whois_emails(domain: str) -> list:
-    """Ищет email через WHOIS домена."""
     try:
         w = whois.whois(domain)
         emails = w.email
@@ -102,57 +194,84 @@ def get_whois_emails(domain: str) -> list:
     return []
 
 
-def search_email_in_html(html: str) -> list:
-    """Ищет email в HTML, meta-тегах, JSON-LD, schema.org."""
-    emails = extract_emails(html)
-    
-    # Ищем обфусцированные email (name [at] domain [dot] com)
-    obfuscated = re.findall(r'([a-zA-Z0-9._%+-]+)\s*\[at\]\s*([a-zA-Z0-9.-]+)\s*\[dot\]\s*([a-zA-Z]{2,})', html)
-    for match in obfuscated:
-        emails.append(f"{match[0]}@{match[1]}.{match[2]}")
-    
-    # Ищем email с разделителями (name(at)domain(dot)com)
-    obfuscated2 = re.findall(r'([a-zA-Z0-9._%+-]+)\(at\)([a-zA-Z0-9.-]+)\(dot\)([a-zA-Z]{2,})', html)
-    for match in obfuscated2:
-        emails.append(f"{match[0]}@{match[1]}.{match[2]}")
-    
-    return list(set(emails))
-
-
 async def search_emails(url: str) -> dict:
     """Основная функция поиска email."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     
     result = {
-        "site_emails": [],
-        "contact_emails": [],
-        "whois_emails": [],
+        "emails": {},  # email -> {"type": str, "sources": list}
         "blocked": False,
+        "pages_checked": [],
     }
     
-    # 1. Ищем на главной странице
+    domain = urlparse(url).netloc.replace("www.", "")
+    
+    # 1. Главная страница
     html = fetch_url(url)
     if html == "BLOCKED":
         result["blocked"] = True
         return result
     
     if html:
-        result["site_emails"] = search_email_in_html(html)
+        result["pages_checked"].append("Главная страница")
+        for email in search_email_in_html(html):
+            if not is_junk_email(email):
+                if email not in result["emails"]:
+                    result["emails"][email] = {"type": classify_email(email), "sources": []}
+                if "Главная страница" not in result["emails"][email]["sources"]:
+                    result["emails"][email]["sources"].append("Главная страница")
         
-        # 2. Ищем на страницах контактов
-        contact_links = find_contact_links(url, html)
-        for link in contact_links[:5]:
+        # 2. Страницы контактов
+        contact_links = find_links_by_keywords(url, html, CONTACT_KEYWORDS)
+        for link in contact_links[:3]:
+            page_name = "Контакты"
+            result["pages_checked"].append(page_name)
             contact_html = fetch_url(link)
             if contact_html and contact_html != "BLOCKED":
-                emails = search_email_in_html(contact_html)
-                result["contact_emails"].extend(emails)
+                for email in search_email_in_html(contact_html):
+                    if not is_junk_email(email):
+                        if email not in result["emails"]:
+                            result["emails"][email] = {"type": classify_email(email), "sources": []}
+                        if page_name not in result["emails"][email]["sources"]:
+                            result["emails"][email]["sources"].append(page_name)
         
-        result["contact_emails"] = list(set(result["contact_emails"]))
+        # 3. Страницы вакансий / карьеры
+        vacancy_links = find_links_by_keywords(url, html, VACANCY_KEYWORDS)
+        for link in vacancy_links[:3]:
+            page_name = "Вакансии / Карьера"
+            result["pages_checked"].append(page_name)
+            vacancy_html = fetch_url(link)
+            if vacancy_html and vacancy_html != "BLOCKED":
+                for email in search_email_in_html(vacancy_html):
+                    if not is_junk_email(email):
+                        if email not in result["emails"]:
+                            result["emails"][email] = {"type": classify_email(email), "sources": []}
+                        if page_name not in result["emails"][email]["sources"]:
+                            result["emails"][email]["sources"].append(page_name)
+        
+        # 4. Другие страницы (пресс, инвесторы)
+        other_links = find_links_by_keywords(url, html, OTHER_KEYWORDS)
+        for link in other_links[:2]:
+            page_name = "Другие разделы"
+            result["pages_checked"].append(page_name)
+            other_html = fetch_url(link)
+            if other_html and other_html != "BLOCKED":
+                for email in search_email_in_html(other_html):
+                    if not is_junk_email(email):
+                        if email not in result["emails"]:
+                            result["emails"][email] = {"type": classify_email(email), "sources": []}
+                        if page_name not in result["emails"][email]["sources"]:
+                            result["emails"][email]["sources"].append(page_name)
     
-    # 3. Ищем через WHOIS
-    domain = urlparse(url).netloc.replace("www.", "")
-    result["whois_emails"] = get_whois_emails(domain)
+    # 5. WHOIS
+    whois_emails = get_whois_emails(domain)
+    for email in whois_emails:
+        if not is_junk_email(email):
+            if email not in result["emails"]:
+                result["emails"][email] = {"type": classify_email(email), "sources": []}
+            if "WHOIS домена" not in result["emails"][email]["sources"]:
+                result["emails"][email]["sources"].append("WHOIS домена")
     
     return result
 
@@ -169,10 +288,12 @@ async def main() -> None:
     async def cmd_start(message: Message) -> None:
         await message.answer(
             "Привет! Я ищу email-адреса компаний.\n\n"
-            "Отправь мне сайт компании (например: yandex.ru), "
-            "и я найду доступные email для связи.\n\n"
-            "⚠️ Некоторые сайты защищены от парсинга — "
-            "в таком случае попробуй найти email вручную на странице «Контакты»."
+            "Отправь мне сайт компании (например: yandex.ru), и я найду:\n"
+            "• email на страницах контактов\n"
+            "• email в разделе вакансий / карьера\n"
+            "• email через WHOIS домена\n\n"
+            "Адреса будут разделены по типам: HR, руководство, общие.\n\n"
+            "⚠️ Некоторые сайты защищены от парсинга — тогда придётся искать вручную."
         )
 
     @dp.message(F.text)
@@ -183,7 +304,7 @@ async def main() -> None:
             await message.answer("Пожалуйста, отправь сайт компании (например: yandex.ru)")
             return
         
-        await message.answer(f"🔍 Ищу email на {url}...")
+        await message.answer(f"🔍 Ищу email на {url}...\nПроверяю: главную, контакты, вакансии, WHOIS...")
         
         try:
             result = await search_emails(url)
@@ -194,66 +315,54 @@ async def main() -> None:
         if result.get("blocked"):
             await message.answer(
                 "🚫 Сайт блокирует автоматические запросы.\n\n"
-                "Это часто у крупных компаний (ОМК, Газпром и т.д.).\n\n"
+                "Это часто у крупных компаний (ОМК, Газпром, Сбер и т.д.).\n\n"
                 "💡 Совет: зайди на сайт вручную, найди раздел "
-                "«Контакты» или «О компании» и скопируй email оттуда."
+                "«Контакты» или «Вакансии» и скопируй email оттуда."
             )
             return
         
-        all_emails = list(set(
-            result["site_emails"] + 
-            result["contact_emails"] + 
-            result["whois_emails"]
-        ))
+        emails_data = result.get("emails", {})
         
-        # Фильтруем мусор
-        filtered = [e for e in all_emails if not e.endswith((
-            "example.com", "test.com", "domain.com", "email.com", "yourdomain.com"
-        ))]
-        
-        # Фильтруем no-reply и технические адреса
-        priority = []
-        low_priority = []
-        for email in filtered:
-            lower = email.lower()
-            if any(x in lower for x in ["no-reply", "noreply", "donotreply", "robot", "autoreply"]):
-                continue
-            elif any(x in lower for x in ["info@", "contact@", "sales@", "press@", "hr@", "job@", "recruitment@"]):
-                priority.append(email)
-            else:
-                low_priority.append(email)
-        
-        final_emails = priority + low_priority
-        
-        if not final_emails:
+        if not emails_data:
             await message.answer(
                 "😕 Email не найден.\n\n"
                 "Возможные причины:\n"
                 "• Сайт защищён от парсинга\n"
-                "• Email спрятан в JavaScript\n"
-                "• Email есть только в PDF/документах\n\n"
+                "• Email спрятан в JavaScript или PDF\n"
+                "• Компания не размещает email публично\n\n"
                 "💡 Попробуй зайти на сайт вручную и найти раздел «Контакты»"
             )
             return
         
-        text = f"📧 Найдено {len(final_emails)} email(ов) для {url}:\n\n"
+        # Группируем по типам
+        by_type = {}
+        for email, data in emails_data.items():
+            t = data["type"]
+            if t not in by_type:
+                by_type[t] = []
+            by_type[t].append((email, data["sources"]))
         
-        # Группируем по приоритету
-        personal = [e for e in final_emails if not any(x in e.lower() for x in ["info@", "contact@", "sales@", "press@", "hr@", "job@"])]
-        general = [e for e in final_emails if any(x in e.lower() for x in ["info@", "contact@", "sales@", "press@", "hr@", "job@"])]
+        # Формируем ответ
+        text = f"📧 Найдено {len(emails_data)} email(ов) для {url}:\n\n"
         
-        if personal:
-            text += "👤 Персональные email (лучше для резюме):\n"
-            for email in personal:
-                text += f"• {email}\n"
-            text += "\n"
+        # Порядок типов
+        type_order = [
+            "👤 HR / Найм",
+            "👔 Руководство",
+            "💼 Продажи / Бизнес",
+            "🏢 Общий",
+            "❓ Другой",
+        ]
         
-        if general:
-            text += "🏢 Общие email:\n"
-            for email in general:
-                text += f"• {email}\n"
+        for t in type_order:
+            if t in by_type:
+                text += f"{t}:\n"
+                for email, sources in by_type[t]:
+                    text += f"  • {email}\n"
+                    text += f"    Источник: {', '.join(sources)}\n"
+                text += "\n"
         
-        text += "\n✅ Теперь можешь отправить резюме напрямую!"
+        text += "✅ Готово! Выбирай подходящий email и отправляй резюме."
         await message.answer(text)
 
     print("Бот запущен...")
