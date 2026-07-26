@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 import whois
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from ddgs import DDGS
 from dotenv import load_dotenv
@@ -24,6 +24,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+HH_HEADERS = {
+    "User-Agent": "EmailHunterBot/1.0 (contact: mailtemphn@gmail.com)"
 }
 
 CONTACT_KEYWORDS = [
@@ -137,7 +141,6 @@ def get_whois_emails(domain: str) -> list:
 
 
 def search_emails_ddg(domain: str) -> list:
-    """Ищет email через DuckDuckGo поиск."""
     emails = set()
     queries = [
         f'site:{domain} "hr@" OR "career@" OR "jobs@"',
@@ -166,16 +169,9 @@ def search_emails_ddg(domain: str) -> list:
 async def search_emails(url: str) -> dict:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    
-    result = {
-        "emails": {},
-        "blocked": False,
-        "pages_checked": [],
-    }
-    
+    result = {"emails": {}, "blocked": False, "pages_checked": []}
     domain = urlparse(url).netloc.replace("www.", "")
     
-    # 1. DuckDuckGo поиск (основной источник)
     ddg_emails = search_emails_ddg(domain)
     for email in ddg_emails:
         if not is_junk_email(email):
@@ -184,7 +180,6 @@ async def search_emails(url: str) -> dict:
             if "DuckDuckGo поиск" not in result["emails"][email]["sources"]:
                 result["emails"][email]["sources"].append("DuckDuckGo поиск")
     
-    # 2. Парсинг сайта (fallback)
     html = fetch_url(url)
     if html == "BLOCKED":
         result["blocked"] = True
@@ -197,7 +192,6 @@ async def search_emails(url: str) -> dict:
                 if "Главная страница" not in result["emails"][email]["sources"]:
                     result["emails"][email]["sources"].append("Главная страница")
         
-        # Страницы контактов
         contact_links = find_links_by_keywords(url, html, CONTACT_KEYWORDS)
         for link in contact_links[:3]:
             contact_html = fetch_url(link)
@@ -209,7 +203,6 @@ async def search_emails(url: str) -> dict:
                         if "Контакты" not in result["emails"][email]["sources"]:
                             result["emails"][email]["sources"].append("Контакты")
         
-        # Страницы вакансий
         vacancy_links = find_links_by_keywords(url, html, VACANCY_KEYWORDS)
         for link in vacancy_links[:3]:
             vacancy_html = fetch_url(link)
@@ -221,7 +214,6 @@ async def search_emails(url: str) -> dict:
                         if "Вакансии / Карьера" not in result["emails"][email]["sources"]:
                             result["emails"][email]["sources"].append("Вакансии / Карьера")
     
-    # 3. WHOIS
     whois_emails = get_whois_emails(domain)
     for email in whois_emails:
         if not is_junk_email(email):
@@ -231,6 +223,39 @@ async def search_emails(url: str) -> dict:
                 result["emails"][email]["sources"].append("WHOIS домена")
     
     return result
+
+
+# ========== HH.ru интеграция ==========
+
+def search_hh_vacancies(query: str, area: str = "113", per_page: int = 5) -> list:
+    url = "https://api.hh.ru/vacancies"
+    params = {"text": query, "area": area, "per_page": per_page}
+    try:
+        r = requests.get(url, headers=HH_HEADERS, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json().get("items", [])
+    except Exception as e:
+        print(f"HH API error: {e}")
+        return []
+
+
+def get_hh_employer(employer_id: str) -> dict:
+    url = f"https://api.hh.ru/employers/{employer_id}"
+    try:
+        r = requests.get(url, headers=HH_HEADERS, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"HH employer error: {e}")
+        return {}
+
+
+def get_domain_from_url(url: str) -> str:
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return urlparse(url).netloc.replace("www.", "")
 
 
 async def main() -> None:
@@ -244,24 +269,117 @@ async def main() -> None:
     @dp.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         await message.answer(
-            "Привет! Я ищу email-адреса компаний.\n\n"
-            "Отправь мне сайт компании (например: yandex.ru), и я найду:\n"
-            "• email через поиск DuckDuckGo\n"
-            "• email на страницах контактов\n"
-            "• email в разделе вакансий / карьера\n"
-            "• email через WHOIS домена\n\n"
-            "Адреса будут разделены по типам: HR, руководство, общие."
+            "Привет! Я помогаю находить контакты компаний для отправки резюме.\n\n"
+            "Команды:\n"
+            "• Отправь сайт (например: omk.ru) — найду email\n"
+            "• /hh <запрос> — поиск вакансий на HH.ru с контактами\n\n"
+            "Примеры:\n"
+            "/hh коммерческий директор Москва\n"
+            "/hh менеджер по продажам СПб\n"
+            "/hh руководитель проекта"
         )
+
+    @dp.message(Command("hh"))
+    async def cmd_hh(message: Message) -> None:
+        query = message.text.replace("/hh", "").strip()
+        if not query:
+            await message.answer(
+                "Отправь запрос после /hh\n\n"
+                "Примеры:\n"
+                "/hh коммерческий директор Москва\n"
+                "/hh менеджер по продажам\n"
+                "/hh HR менеджер СПб"
+            )
+            return
+        
+        # Определяем город
+        area = "113"  # Россия
+        city_name = "Россия"
+        q_lower = query.lower()
+        
+        if "москва" in q_lower:
+            area = "1"
+            city_name = "Москва"
+            query = q_lower.replace("москва", "").strip()
+        elif "спб" in q_lower or "питер" in q_lower or "санкт-петербург" in q_lower:
+            area = "2"
+            city_name = "Санкт-Петербург"
+            query = q_lower.replace("спб", "").replace("питер", "").replace("санкт-петербург", "").strip()
+        elif "екатеринбург" in q_lower:
+            area = "3"
+            city_name = "Екатеринбург"
+            query = q_lower.replace("екатеринбург", "").strip()
+        elif "новосибирск" in q_lower:
+            area = "4"
+            city_name = "Новосибирск"
+            query = q_lower.replace("новосибирск", "").strip()
+        
+        await message.answer(f"🔍 Ищу вакансии на HH.ru: «{query}» ({city_name})...")
+        
+        vacancies = search_hh_vacancies(query, area, per_page=5)
+        
+        if not vacancies:
+            await message.answer("😕 Вакансии не найдены. Попробуй другой запрос.")
+            return
+        
+        text = f"🔍 Найдено вакансий: {len(vacancies)}\n\n"
+        
+        for i, vac in enumerate(vacancies, 1):
+            name = vac.get("name", "—")
+            employer = vac.get("employer", {})
+            employer_name = employer.get("name", "—")
+            employer_id = employer.get("id")
+            vac_url = vac.get("alternate_url", "—")
+            
+            # Контакты из вакансии (если работодатель указал)
+            contacts = vac.get("contacts")
+            contact_email = None
+            contact_name = None
+            if contacts:
+                contact_email = contacts.get("email")
+                contact_name = contacts.get("name")
+            
+            # Получаем сайт работодателя
+            site_url = None
+            if employer_id:
+                emp_data = get_hh_employer(employer_id)
+                site_url = emp_data.get("site_url")
+            
+            text += f"{i}. {employer_name}\n"
+            text += f"   💼 {name}\n"
+            
+            if contact_email:
+                text += f"   📧 Контакт в вакансии: {contact_email}\n"
+                if contact_name:
+                    text += f"   👤 {contact_name}\n"
+            
+            if site_url:
+                domain = get_domain_from_url(site_url)
+                text += f"   🌐 Сайт: {site_url}\n"
+                # Ищем email через DuckDuckGo (только для первых 3)
+                if i <= 3:
+                    ddg_emails = search_emails_ddg(domain)
+                    good_emails = [e for e in ddg_emails if not is_junk_email(e)]
+                    if good_emails:
+                        text += f"   📧 Найдено: {', '.join(good_emails[:3])}\n"
+            
+            text += f"   🔗 {vac_url}\n\n"
+        
+        text += "💡 Совет: если не нашёл email — отправь мне сайт компании, я поищу подробнее."
+        await message.answer(text)
 
     @dp.message(F.text)
     async def handle_text(message: Message) -> None:
         url = message.text.strip()
         
         if "." not in url or " " in url:
-            await message.answer("Пожалуйста, отправь сайт компании (например: omk.ru)")
+            await message.answer(
+                "Отправь сайт компании (например: omk.ru)\n"
+                "Или используй /hh для поиска вакансий"
+            )
             return
         
-        await message.answer(f"🔍 Ищу email на {url}...\nDuckDuckGo + сайт + WHOIS...")
+        await message.answer(f"🔍 Ищу email на {url}...")
         
         try:
             result = await search_emails(url)
@@ -276,13 +394,11 @@ async def main() -> None:
                 "😕 Email не найден.\n\n"
                 "Возможные причины:\n"
                 "• Компания не публикует email публично\n"
-                "• Email спрятан в JavaScript или PDF\n"
                 "• Сайт защищён от парсинга\n\n"
-                "💡 Попробуй зайти на сайт вручную и найти раздел «Контакты»"
+                "💡 Попробуй найти вакансию компании через /hh"
             )
             return
         
-        # Группируем по типам
         by_type = {}
         for email, data in emails_data.items():
             t = data["type"]
@@ -291,7 +407,6 @@ async def main() -> None:
             by_type[t].append((email, data["sources"]))
         
         text = f"📧 Найдено {len(emails_data)} email(ов) для {url}:\n\n"
-        
         type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой"]
         
         for t in type_order:
