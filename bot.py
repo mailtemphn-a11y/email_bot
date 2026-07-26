@@ -1,8 +1,12 @@
 import asyncio
 import os
 import re
+import smtplib
 import sys
 import time
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -16,6 +20,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+
+# Храним путь к резюме (загружается один раз)
+RESUME_PATH = "resume.pdf"
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
@@ -24,10 +34,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-HH_HEADERS = {
-    "User-Agent": "EmailHunterBot/1.0 (contact: mailtemphn@gmail.com)"
 }
 
 CONTACT_KEYWORDS = [
@@ -225,37 +231,35 @@ async def search_emails(url: str) -> dict:
     return result
 
 
-# ========== HH.ru интеграция ==========
-
-def search_hh_vacancies(query: str, area: str = "113", per_page: int = 5) -> list:
-    url = "https://api.hh.ru/vacancies"
-    params = {"text": query, "area": area, "per_page": per_page}
+def send_email(to_email: str, subject: str, body: str, attachment_path: str | None = None) -> str:
+    """Отправляет email через SMTP."""
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+        return "❌ SMTP не настроен. Проверь переменные EMAIL_ADDRESS и EMAIL_PASSWORD."
+    
     try:
-        r = requests.get(url, headers=HH_HEADERS, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json().get("items", [])
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, "rb") as f:
+                part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
+            part["Content-Disposition"] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+            msg.attach(part)
+        
+        server = smtplib.SMTP_SSL(SMTP_SERVER, 465)
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+        server.quit()
+        
+        return f"✅ Письмо отправлено на {to_email}"
+    except smtplib.SMTPAuthenticationError:
+        return "❌ Ошибка авторизации SMTP. Проверь EMAIL_ADDRESS и EMAIL_PASSWORD (должен быть App Password, не обычный пароль Gmail)."
     except Exception as e:
-        print(f"HH API error: {e}")
-        return []
-
-
-def get_hh_employer(employer_id: str) -> dict:
-    url = f"https://api.hh.ru/employers/{employer_id}"
-    try:
-        r = requests.get(url, headers=HH_HEADERS, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"HH employer error: {e}")
-        return {}
-
-
-def get_domain_from_url(url: str) -> str:
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return urlparse(url).netloc.replace("www.", "")
+        return f"❌ Ошибка отправки: {e}"
 
 
 async def main() -> None:
@@ -269,104 +273,78 @@ async def main() -> None:
     @dp.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         await message.answer(
-            "Привет! Я помогаю находить контакты компаний для отправки резюме.\n\n"
+            "Привет! Я помогаю находить контакты компаний и отправлять резюме.\n\n"
             "Команды:\n"
             "• Отправь сайт (например: omk.ru) — найду email\n"
-            "• /hh <запрос> — поиск вакансий на HH.ru с контактами\n\n"
-            "Примеры:\n"
-            "/hh коммерческий директор Москва\n"
-            "/hh менеджер по продажам СПб\n"
-            "/hh руководитель проекта"
+            "• Отправь PDF с резюме — сохраню для рассылки\n"
+            "• /send email@company.ru Текст — отправлю резюме\n\n"
+            "Пример:\n"
+            "/send info@omk.ru Здравствуйте! Предлагаю свою кандидатуру на позицию коммерческого директора."
         )
 
-    @dp.message(Command("hh"))
-    async def cmd_hh(message: Message) -> None:
-        query = message.text.replace("/hh", "").strip()
-        if not query:
+    @dp.message(F.document)
+    async def handle_document(message: Message) -> None:
+        """Обрабатывает загрузку PDF резюме."""
+        if not message.document:
+            await message.answer("Отправь файл PDF.")
+            return
+        
+        doc = message.document
+        if not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
+            await message.answer("Пожалуйста, отправь файл в формате PDF.")
+            return
+        
+        await message.answer("⏳ Загружаю резюме...")
+        
+        try:
+            file = await bot.get_file(doc.file_id)
+            await bot.download_file(file.file_path, RESUME_PATH)
             await message.answer(
-                "Отправь запрос после /hh\n\n"
-                "Примеры:\n"
-                "/hh коммерческий директор Москва\n"
-                "/hh менеджер по продажам\n"
-                "/hh HR менеджер СПб"
+                f"✅ Резюме сохранено: {doc.file_name}\n\n"
+                f"Теперь можешь отправить команду:\n"
+                f"/send email@company.ru Текст письма"
+            )
+        except Exception as e:
+            await message.answer(f"❌ Ошибка загрузки: {e}")
+
+    @dp.message(Command("send"))
+    async def cmd_send(message: Message) -> None:
+        """Отправляет резюме на указанный email."""
+        if not os.path.exists(RESUME_PATH):
+            await message.answer(
+                "❌ Резюме не загружено.\n\n"
+                "Сначала отправь мне PDF с резюме, потом используй /send."
             )
             return
         
-        # Определяем город
-        area = "113"  # Россия
-        city_name = "Россия"
-        q_lower = query.lower()
-        
-        if "москва" in q_lower:
-            area = "1"
-            city_name = "Москва"
-            query = q_lower.replace("москва", "").strip()
-        elif "спб" in q_lower or "питер" in q_lower or "санкт-петербург" in q_lower:
-            area = "2"
-            city_name = "Санкт-Петербург"
-            query = q_lower.replace("спб", "").replace("питер", "").replace("санкт-петербург", "").strip()
-        elif "екатеринбург" in q_lower:
-            area = "3"
-            city_name = "Екатеринбург"
-            query = q_lower.replace("екатеринбург", "").strip()
-        elif "новосибирск" in q_lower:
-            area = "4"
-            city_name = "Новосибирск"
-            query = q_lower.replace("новосибирск", "").strip()
-        
-        await message.answer(f"🔍 Ищу вакансии на HH.ru: «{query}» ({city_name})...")
-        
-        vacancies = search_hh_vacancies(query, area, per_page=5)
-        
-        if not vacancies:
-            await message.answer("😕 Вакансии не найдены. Попробуй другой запрос.")
+        # Формат: /send email@company.ru Текст письма
+        args = message.text.replace("/send", "").strip()
+        if not args:
+            await message.answer(
+                "Использование:\n"
+                "/send email@company.ru Здравствуйте, хочу предложить свою кандидатуру..."
+            )
             return
         
-        text = f"🔍 Найдено вакансий: {len(vacancies)}\n\n"
+        parts = args.split(" ", 1)
+        if len(parts) < 1 or "@" not in parts[0]:
+            await message.answer(
+                "❌ Неверный формат.\n\n"
+                "Пример:\n"
+                "/send info@omk.ru Здравствуйте! Предлагаю свою кандидатуру."
+            )
+            return
         
-        for i, vac in enumerate(vacancies, 1):
-            name = vac.get("name", "—")
-            employer = vac.get("employer", {})
-            employer_name = employer.get("name", "—")
-            employer_id = employer.get("id")
-            vac_url = vac.get("alternate_url", "—")
-            
-            # Контакты из вакансии (если работодатель указал)
-            contacts = vac.get("contacts")
-            contact_email = None
-            contact_name = None
-            if contacts:
-                contact_email = contacts.get("email")
-                contact_name = contacts.get("name")
-            
-            # Получаем сайт работодателя
-            site_url = None
-            if employer_id:
-                emp_data = get_hh_employer(employer_id)
-                site_url = emp_data.get("site_url")
-            
-            text += f"{i}. {employer_name}\n"
-            text += f"   💼 {name}\n"
-            
-            if contact_email:
-                text += f"   📧 Контакт в вакансии: {contact_email}\n"
-                if contact_name:
-                    text += f"   👤 {contact_name}\n"
-            
-            if site_url:
-                domain = get_domain_from_url(site_url)
-                text += f"   🌐 Сайт: {site_url}\n"
-                # Ищем email через DuckDuckGo (только для первых 3)
-                if i <= 3:
-                    ddg_emails = search_emails_ddg(domain)
-                    good_emails = [e for e in ddg_emails if not is_junk_email(e)]
-                    if good_emails:
-                        text += f"   📧 Найдено: {', '.join(good_emails[:3])}\n"
-            
-            text += f"   🔗 {vac_url}\n\n"
+        to_email = parts[0].strip()
+        body = parts[1].strip() if len(parts) > 1 else "Добрый день! Предлагаю Вашему вниманию моё резюме."
         
-        text += "💡 Совет: если не нашёл email — отправь мне сайт компании, я поищу подробнее."
-        await message.answer(text)
+        # Формируем тему
+        subject = f"Резюме — {EMAIL_ADDRESS.split('@')[0] if EMAIL_ADDRESS else 'Кандидат'}"
+        
+        await message.answer(f"⏳ Отправляю резюме на {to_email}...")
+        
+        result = send_email(to_email, subject, body, RESUME_PATH)
+        await message.answer(result)
 
     @dp.message(F.text)
     async def handle_text(message: Message) -> None:
@@ -375,7 +353,7 @@ async def main() -> None:
         if "." not in url or " " in url:
             await message.answer(
                 "Отправь сайт компании (например: omk.ru)\n"
-                "Или используй /hh для поиска вакансий"
+                "Или используй /send для отправки резюме"
             )
             return
         
@@ -395,7 +373,7 @@ async def main() -> None:
                 "Возможные причины:\n"
                 "• Компания не публикует email публично\n"
                 "• Сайт защищён от парсинга\n\n"
-                "💡 Попробуй найти вакансию компании через /hh"
+                "💡 Попробуй зайти на сайт вручную и найти раздел «Контакты»"
             )
             return
         
@@ -417,7 +395,7 @@ async def main() -> None:
                     text += f"    Источник: {', '.join(sources)}\n"
                 text += "\n"
         
-        text += "✅ Готово! Выбирай подходящий email и отправляй резюме."
+        text += "✅ Готово! Чтобы отправить резюме:\n/send email@company.ru Текст письма"
         await message.answer(text)
 
     print("Бот запущен...")
