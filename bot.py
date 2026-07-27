@@ -64,7 +64,6 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Агрегаторы, соцсети, госорганы
 SKIP_DOMAINS = {
     "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
@@ -93,16 +92,6 @@ SKIP_DOMAINS = {
     "sroo.ru", "sro-soyuz.ru", "np-sro.ru", "sro-rf.ru",
 }
 
-# Личные почтовые сервисы (не корпоративные)
-PERSONAL_EMAIL_DOMAINS = {
-    "mail.ru", "bk.ru", "list.ru", "inbox.ru", "internet.ru",
-    "yandex.ru", "ya.ru", "yandex.com", "gmail.com", "googlemail.com",
-    "hotmail.com", "outlook.com", "live.com", "icloud.com",
-    "me.com", "mac.com", "rambler.ru", "lenta.ru", "autorambler.ru",
-    "myrambler.ru", "ro.ru", "163.com", "qq.com",
-}
-
-# Слова в title — агрегаторы, СРО, госорганы
 SKIP_TITLE_WORDS = [
     "топ-", "топ ", "рейтинг", "адреса", "телефоны", "отзывы",
     "справочник", "каталог", "портал", "обзор", "сравнение",
@@ -141,13 +130,6 @@ JUNK_EMAILS = {
     "example@example.ru", "example@example.com", "test@test.com",
     "admin@admin.ru", "user@user.ru", "info@info.ru", "info@mail.ru",
 }
-
-
-def is_personal_email(email: str) -> bool:
-    """Проверяет, является ли email личным (не корпоративным)."""
-    lower = email.lower()
-    domain = lower.split("@")[-1]
-    return domain in PERSONAL_EMAIL_DOMAINS
 
 
 def extract_emails(text: str) -> list:
@@ -210,9 +192,8 @@ def is_junk_email(email: str) -> bool:
 
 
 def classify_email(email: str) -> str:
+    """Классифицирует email по типу. Личные ящики (mail.ru, yandex.ru и т.д.) классифицируются так же, как корпоративные."""
     lower = email.lower()
-    if is_personal_email(email):
-        return "⚠️ Личный ящик"
     hr_patterns = ["hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@", "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@", "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@", "hr.", "career.", "recruit.", "job.", "vacancy.", "work."]
     leadership_patterns = ["ceo@", "director@", "chief@", "president@", "manager@", "head@", "founder@", "owner@", "md@", "dir@", "managing@", "executive@", "lead@", "boss@", "supervisor@", "руководство@", "директор@", "гендиректор@", "prezes@", "direktor@", "leiter@"]
     sales_patterns = ["sales@", "marketing@", "bizdev@", "business@", "commercial@", "commerce@", "trade@", "dealer@", "distrib@", "partner@", "b2b@", "client@", "customers@", "zakaz@", "prodaza@", "zakupki@"]
@@ -400,7 +381,7 @@ def format_company_text(idx: int, company: dict) -> str:
                 by_type[t] = []
             by_type[t].append(email)
         
-        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой", "⚠️ Личный ящик"]
+        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой"]
         for t in type_order:
             if t in by_type:
                 for email in by_type[t]:
@@ -426,9 +407,8 @@ async def main() -> None:
             "• Отправь сайт (например: omk.ru) — найду email\n"
             "• /find <запрос> — найду компании и их email\n"
             "• /reset — сбросить историю\n\n"
-            "Email помечаются:\n"
-            "👤 HR / 👔 Руководство / 💼 Продажи / 🏢 Общий\n"
-            "⚠️ Личный ящик — на mail.ru, yandex.ru (меньше шансов ответа)\n\n"
+            "Email классифицируются:\n"
+            "👤 HR / 👔 Руководство / 💼 Продажи / 🏢 Общий\n\n"
             "Примеры:\n"
             "/find строительные компании Москва\n"
             "/find IT аутсорсинг Санкт-Петербург"
@@ -550,7 +530,7 @@ async def main() -> None:
             by_type[t].append((email, data["sources"]))
         
         text = f"📧 Найдено {len(emails_data)} email(ов) для {url}:\n\n"
-        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой", "⚠️ Личный ящик"]
+        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой"]
         
         for t in type_order:
             if t in by_type:
