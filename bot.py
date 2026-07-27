@@ -306,47 +306,120 @@ def clean_title(title: str) -> str:
 
 def find_company_by_name(name: str) -> dict | None:
     """Ищет сайт компании по названию через DuckDuckGo."""
-    query = f'{name} официальный сайт'
+    name_lower = name.lower().strip()
+    
+    # Транслитерация для русских названий
+    translit_map = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        ' ': '', '-': '', '"': '', "'": '',
+    }
+    name_translit = ''.join(translit_map.get(c, c) for c in name_lower)
+    
+    # Список запросов для поиска
+    search_queries = [
+        f'"{name}" официальный сайт',
+        f'{name} официальный сайт',
+        f'"{name}"',
+        f'{name}',
+    ]
+    
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=10))
-            for r in results:
-                href = r.get("href", "")
-                title = r.get("title", "").strip()
-                if not href or not title:
+            for query in search_queries:
+                try:
+                    results = list(ddgs.text(query, max_results=15))
+                    candidates = []
+                    
+                    for r in results:
+                        href = r.get("href", "")
+                        title = r.get("title", "").strip()
+                        if not href or not title:
+                            continue
+                        if is_aggregator_title(title):
+                            continue
+                        
+                        parsed = urlparse(href)
+                        domain = parsed.netloc.replace("www.", "").lower()
+                        
+                        if not domain:
+                            continue
+                        
+                        skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
+                        if skip:
+                            continue
+                        
+                        if any(domain.endswith(g) for g in [".gov.ru", ".gov", ".mil", ".mos.ru"]):
+                            continue
+                        
+                        if len(domain) > 40:
+                            continue
+                        
+                        bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "directory", "sro", "np-"]
+                        if any(w in domain for w in bad_words):
+                            continue
+                        
+                        # Проверяем, является ли домен магазином/поддоменом, а не основным сайтом
+                        shop_indicators = ["shop.", "store.", "market.", "buy.", "sale.", "mall.", "dzen.", "zen."]
+                        is_shop = any(domain.startswith(s) or f".{s}" in domain for s in shop_indicators)
+                        
+                        # Оцениваем релевантность домена
+                        score = 0
+                        domain_base = domain.replace(".ru", "").replace(".com", "").replace(".net", "").replace(".org", "").replace(".info", "")
+                        
+                        # Если домен содержит название компании — высокий скор
+                        if name_lower in domain_base or name_translit in domain_base:
+                            score += 100
+                        
+                        # Если название компании в title — средний скор
+                        if name_lower in title.lower():
+                            score += 50
+                        
+                        # Если это магазин — штраф
+                        if is_shop:
+                            score -= 80
+                        
+                        # Если домен очень короткий и совпадает с названием — бонус
+                        if len(domain_base) <= len(name_translit) + 3 and (name_lower in domain_base or name_translit in domain_base):
+                            score += 50
+                        
+                        candidates.append({
+                            "name": clean_title(title),
+                            "domain": domain,
+                            "url": href,
+                            "score": score,
+                            "is_shop": is_shop,
+                        })
+                    
+                    # Сортируем по скору (лучшие первыми)
+                    candidates.sort(key=lambda x: x["score"], reverse=True)
+                    
+                    # Берём лучший кандидат
+                    for cand in candidates:
+                        if cand["score"] >= 50:
+                            return {
+                                "name": cand["name"],
+                                "domain": cand["domain"],
+                                "url": cand["url"],
+                            }
+                    
+                    # Если нет высокоскорных, берём первый немагазин
+                    for cand in candidates:
+                        if not cand["is_shop"]:
+                            return {
+                                "name": cand["name"],
+                                "domain": cand["domain"],
+                                "url": cand["url"],
+                            }
+                    
+                except Exception:
                     continue
-                if is_aggregator_title(title):
-                    continue
-                
-                parsed = urlparse(href)
-                domain = parsed.netloc.replace("www.", "").lower()
-                
-                if not domain:
-                    continue
-                
-                skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
-                if skip:
-                    continue
-                
-                if any(domain.endswith(g) for g in [".gov.ru", ".gov", ".mil", ".mos.ru"]):
-                    continue
-                
-                if len(domain) > 40:
-                    continue
-                
-                bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "directory", "sro", "np-"]
-                if any(w in domain for w in bad_words):
-                    continue
-                
-                return {
-                    "name": clean_title(title),
-                    "domain": domain,
-                    "url": href,
-                }
     except Exception:
         pass
     return None
-
 
 def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
     companies = []
