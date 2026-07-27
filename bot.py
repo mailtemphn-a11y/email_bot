@@ -55,7 +55,8 @@ def mark_domain_shown(user_id: int, domain: str):
 
 init_db()
 
-EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+# Улучшенная regex — email должен заканчиваться на буквы, не на картинку
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}\b")
 HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
 HEADERS = {
@@ -64,7 +65,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Расширенный список агрегаторов
+# Агрегаторы, соцсети, госорганы, СРО
 SKIP_DOMAINS = {
     "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
@@ -83,12 +84,20 @@ SKIP_DOMAINS = {
     "stroimaterialy.ru", "stroypark.ru", "stroyka.ru",
     "vse-zastroyshiki.ru", "novostroy-m.ru", "kvartira.ru",
     "nedvizhimost.ru", "realty.ru", "move.ru", "mirkvartir.ru",
-    "cian.ru", "domofond.ru", "yandex.realty", "etagi.com",
+    "domofond.ru", "yandex.realty", "etagi.com",
     "m2.ru", "gdeetotdom.ru", "novostroy.su", "incom.ru",
     "bn.ru", "snimi.ru", "rentflot.ru", "kvartus.ru",
+    # Соцсети
+    "vk.com", "m.vk.com", "t.me", "telegram.org", "facebook.com",
+    "instagram.com", "twitter.com", "x.com", "linkedin.com",
+    # Госорганы
+    "mos.ru", "gov.ru", "garant.ru", "consultant.ru",
+    # СРО
+    "sro", "npmaap.ru", "sro-apoek.ru", "sroaap.ru", "sroaas.ru",
+    "sroo.ru", "sro-soyuz.ru", "np-sro.ru", "sro-rf.ru",
 }
 
-# Слова в title, которые указывают на агрегатор/рейтинг/список
+# Слова в title — агрегаторы, СРО, госорганы
 SKIP_TITLE_WORDS = [
     "топ-", "топ ", "рейтинг", "адреса", "телефоны", "отзывы",
     "справочник", "каталог", "портал", "обзор", "сравнение",
@@ -98,6 +107,10 @@ SKIP_TITLE_WORDS = [
     "квартиры", "недвижимость", "продажа",
     "сайты", "все ", "полный список", "перечень",
     "карта", "фото", "цены", "подмосковья",
+    "СРО", "саморегулируемая", "саморегулируемое", "сообщество",
+    "префектура", "административный округ", "округа",
+    "правительство", "министерство", "государственн", "муниципал",
+    "главная", "вконтакте", "vk", "facebook", "instagram",
 ]
 
 # Технические email-паттерны
@@ -111,21 +124,44 @@ JUNK_EMAIL_PATTERNS = [
     r"heroku",
     r"firebase",
     r"^[0-9a-f]{8,}@",
+    r"logo@",
+    r"image@",
+    r"banner@",
+    r"icon@",
+    r"avatar@",
 ]
+
+# Мусорные email
+JUNK_EMAILS = {
+    "example@example.ru", "example@example.com", "test@test.com",
+    "admin@admin.ru", "user@user.ru", "info@info.ru",
+}
 
 
 def extract_emails(text: str) -> list:
     if not text:
         return []
     emails = EMAIL_REGEX.findall(text)
-    # Убираем лишние точки в начале
     cleaned = []
     for e in emails:
-        e = e.strip()
+        e = e.strip().lower()
+        # Убираем точки в начале
         while e.startswith("."):
             e = e[1:]
-        if "@" in e and "." in e.split("@")[1]:
-            cleaned.append(e)
+        # Проверяем что это реальный email
+        if "@" not in e:
+            continue
+        parts = e.split("@")
+        if len(parts) != 2:
+            continue
+        domain_part = parts[1]
+        # Не должен заканчиваться на картинку
+        if domain_part.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")):
+            continue
+        # Не должен содержать слеши
+        if "/" in e:
+            continue
+        cleaned.append(e)
     return list(set(cleaned))
 
 
@@ -151,11 +187,19 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
 
 def is_junk_email(email: str) -> bool:
     lower = email.lower()
+    
+    # Точные совпадения
+    if lower in JUNK_EMAILS:
+        return True
+    
+    # Паттерны
     for pattern in JUNK_EMAIL_PATTERNS:
         if re.search(pattern, lower):
             return True
+    
     junk_domains = ["example.com", "test.com", "domain.com", "email.com", "yourdomain.com", "localhost", "site.com", "company.com"]
     junk_prefixes = ["no-reply", "noreply", "donotreply", "robot", "autoreply", "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster", "postmaster", "webmaster", "root", "administrator", "security", "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@"]
+    
     if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
         return True
     if any(lower.startswith(p) for p in junk_prefixes):
@@ -205,8 +249,9 @@ def search_emails_ddg(domain: str) -> list:
                         text = f"{r.get('title', '')} {r.get('body', '')} {r.get('href', '')}"
                         found = EMAIL_REGEX.findall(text)
                         for email in found:
-                            if domain in email.lower():
-                                emails.add(email)
+                            email_clean = email.lower().strip().lstrip(".")
+                            if domain in email_clean:
+                                emails.add(email_clean)
                 except Exception:
                     continue
     except Exception:
@@ -246,6 +291,7 @@ def search_emails_for_domain(domain: str) -> dict:
         else:
             whois_emails = []
         for email in whois_emails:
+            email = email.lower().strip().lstrip(".")
             if not is_junk_email(email):
                 if email not in result["emails"]:
                     result["emails"][email] = {"type": classify_email(email), "sources": []}
@@ -258,8 +304,6 @@ def search_emails_for_domain(domain: str) -> dict:
 
 
 def clean_title(title: str) -> str:
-    """Очищает title от мусора."""
-    # Убираем суффиксы
     suffixes = [
         " — Яндекс", " | Яндекс", " - Google", " | Google",
         " | ВКонтакте", " — ВКонтакте", " | Facebook",
@@ -272,7 +316,6 @@ def clean_title(title: str) -> str:
         if suffix in title:
             title = title.split(suffix)[0].strip()
     
-    # Убираем многоточие и лишние пробелы
     title = title.replace("...", "").replace("…", "").strip()
     title = re.sub(r'\s+', ' ', title)
     
@@ -299,7 +342,6 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         if not href or not title:
                             continue
                         
-                        # Пропускаем агрегаторы по title
                         if is_aggregator_title(title):
                             continue
                         
@@ -314,12 +356,18 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         if skip:
                             continue
                         
+                        # Пропускаем госдомены (кроме известных компаний)
+                        if any(domain.endswith(g) for g in [".gov.ru", ".gov", ".mil", ".mos.ru", ".spb.ru"]):
+                            # Разрешаем mosproject.ru, но не sao.mos.ru
+                            if "mosproject" not in domain and "project" not in domain:
+                                continue
+                        
                         # Пропускаем слишком длинные домены
                         if len(domain) > 40:
                             continue
                         
                         # Пропускаем поддомены агрегаторов
-                        bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "catalog", "directory"]
+                        bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "directory", "sro", "np-"]
                         if any(w in domain for w in bad_words):
                             continue
                         
@@ -332,7 +380,6 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         seen_domains.add(domain)
                         clean = clean_title(title)
                         
-                        # Повторная проверка после очистки
                         if is_aggregator_title(clean):
                             continue
                         
