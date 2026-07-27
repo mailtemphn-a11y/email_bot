@@ -192,7 +192,6 @@ def is_junk_email(email: str) -> bool:
 
 
 def classify_email(email: str) -> str:
-    """Классифицирует email по типу. Личные ящики (mail.ru, yandex.ru и т.д.) классифицируются так же, как корпоративные."""
     lower = email.lower()
     hr_patterns = ["hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@", "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@", "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@", "hr.", "career.", "recruit.", "job.", "vacancy.", "work."]
     leadership_patterns = ["ceo@", "director@", "chief@", "president@", "manager@", "head@", "founder@", "owner@", "md@", "dir@", "managing@", "executive@", "lead@", "boss@", "supervisor@", "руководство@", "директор@", "гендиректор@", "prezes@", "direktor@", "leiter@"]
@@ -305,6 +304,50 @@ def clean_title(title: str) -> str:
     return title
 
 
+def find_company_by_name(name: str) -> dict | None:
+    """Ищет сайт компании по названию через DuckDuckGo."""
+    query = f'{name} официальный сайт'
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=10))
+            for r in results:
+                href = r.get("href", "")
+                title = r.get("title", "").strip()
+                if not href or not title:
+                    continue
+                if is_aggregator_title(title):
+                    continue
+                
+                parsed = urlparse(href)
+                domain = parsed.netloc.replace("www.", "").lower()
+                
+                if not domain:
+                    continue
+                
+                skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
+                if skip:
+                    continue
+                
+                if any(domain.endswith(g) for g in [".gov.ru", ".gov", ".mil", ".mos.ru"]):
+                    continue
+                
+                if len(domain) > 40:
+                    continue
+                
+                bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "directory", "sro", "np-"]
+                if any(w in domain for w in bad_words):
+                    continue
+                
+                return {
+                    "name": clean_title(title),
+                    "domain": domain,
+                    "url": href,
+                }
+    except Exception:
+        pass
+    return None
+
+
 def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
     companies = []
     seen_domains = set()
@@ -405,13 +448,13 @@ async def main() -> None:
             "Привет! Я ищу email-адреса компаний.\n\n"
             "Команды:\n"
             "• Отправь сайт (например: omk.ru) — найду email\n"
-            "• /find <запрос> — найду компании и их email\n"
+            "• /find <запрос> — найду компании по теме\n"
+            "• /company <название> — найду сайт и email конкретной компании\n"
             "• /reset — сбросить историю\n\n"
-            "Email классифицируются:\n"
-            "👤 HR / 👔 Руководство / 💼 Продажи / 🏢 Общий\n\n"
             "Примеры:\n"
-            "/find строительные компании Москва\n"
-            "/find IT аутсорсинг Санкт-Петербург"
+            "/company Газпром\n"
+            "/company Лукойл, Роснефть, Сбер\n"
+            "/find строительные компании Москва"
         )
 
     @dp.message(Command("reset"))
@@ -424,6 +467,101 @@ async def main() -> None:
         deleted = c.rowcount
         conn.close()
         await message.answer(f"🗑 История сброшена. Удалено {deleted} записей.")
+
+    @dp.message(Command("company"))
+    async def cmd_company(message: Message) -> None:
+        args = message.text.replace("/company", "").strip()
+        if not args:
+            await message.answer(
+                "Отправь название компании после /company\n\n"
+                "Примеры:\n"
+                "/company Газпром\n"
+                "/company Лукойл, Роснефть, Татнефть\n"
+                "/company А101, КОРТРОС, Донстрой"
+            )
+            return
+        
+        # Разбиваем по запятым или переносам строк
+        names = [n.strip() for n in re.split(r'[,;\n]', args) if n.strip()]
+        if not names:
+            await message.answer("❌ Не удалось распознать названия компаний.")
+            return
+        
+        if len(names) > 5:
+            await message.answer("⚠️ Максимум 5 компаний за раз. Беру первые 5.")
+            names = names[:5]
+        
+        await message.answer(f"🔍 Ищу сайты и email для {len(names)} компаний...")
+        
+        results = []
+        for name in names:
+            comp = find_company_by_name(name)
+            if comp:
+                result = search_emails_for_domain(comp["domain"])
+                comp["emails"] = result["emails"]
+                comp["blocked"] = result["blocked"]
+                results.append(comp)
+            else:
+                results.append({
+                    "name": name,
+                    "domain": "—",
+                    "url": "—",
+                    "emails": {},
+                    "blocked": False,
+                    "not_found": True,
+                })
+            await asyncio.sleep(1)
+        
+        # Формируем ответ
+        text = f"✅ Результаты поиска по названиям:\n\n"
+        
+        for i, comp in enumerate(results, 1):
+            if comp.get("not_found"):
+                text += f"{i}. {comp['name']}\n"
+                text += f"   ❌ Сайт не найден\n\n"
+                continue
+            
+            text += f"{i}. {comp['name']}\n"
+            text += f"   🌐 {comp['domain']}\n"
+            
+            emails = comp.get("emails", {})
+            if not emails:
+                text += f"   📧 Email не найден\n"
+            else:
+                by_type = {}
+                for email, data in emails.items():
+                    t = data.get("type", "Другой")
+                    if t not in by_type:
+                        by_type[t] = []
+                    by_type[t].append(email)
+                
+                type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой"]
+                for t in type_order:
+                    if t in by_type:
+                        for email in by_type[t]:
+                            text += f"   📧 {email} ({t})\n"
+            
+            text += "\n"
+        
+        # Разбиваем на части если длинно
+        if len(text) > 3800:
+            parts = []
+            current = ""
+            for line in text.split("\n"):
+                if len(current) + len(line) > 3800:
+                    parts.append(current)
+                    current = line + "\n"
+                else:
+                    current += line + "\n"
+            if current:
+                parts.append(current)
+            
+            for part in parts:
+                await message.answer(part)
+        else:
+            await message.answer(text)
+        
+        await message.answer("✅ Готово! Отправь /company с новыми названиями или /find для поиска по теме.")
 
     @dp.message(Command("find"))
     async def cmd_find(message: Message) -> None:
@@ -502,7 +640,9 @@ async def main() -> None:
         if "." not in url or " " in url:
             await message.answer(
                 "Отправь сайт компании (например: omk.ru)\n"
-                "Или используй /find для поиска компаний"
+                "Или используй команды:\n"
+                "/find — поиск по теме\n"
+                "/company — поиск по названию"
             )
             return
         
