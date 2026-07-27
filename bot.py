@@ -64,7 +64,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Агрегаторы и мусорные домены
+# Расширенный список агрегаторов
 SKIP_DOMAINS = {
     "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
@@ -75,38 +75,58 @@ SKIP_DOMAINS = {
     "vseinstrumenti.ru", "wildberries.ru", "ozon.ru",
     "market.yandex.ru", "aliexpress.ru", "sberbank.ru", "tinkoff.ru",
     "vtb.ru", "gazprombank.ru", "alfabank.ru", "raiffeisen.ru",
-    # Агрегаторы компаний
     "jsprav.ru", "spravker.ru", "spravochnik.ru", "org.ru",
     "stroikompanies.ru", "kronotech.ru", "stroykontrol.info",
-    "vse-stroyka.ru", "vse-otzivi.ru", "zoon.ru", "yell.ru",
-    "top100.rambler.ru", "rating.ru", "rate.ru", "otzovik.com",
-    "irecommend.ru", "yandex.maps", "maps.yandex.ru",
+    "vse-stroyka.ru", "vse-otzivi.ru", "top100.rambler.ru",
+    "rating.ru", "rate.ru", "irecommend.ru", "maps.yandex.ru",
+    "zastroev.ru", "novostroycity.ru", "novomoscow.ru",
+    "stroimaterialy.ru", "stroypark.ru", "stroyka.ru",
+    "vse-zastroyshiki.ru", "novostroy-m.ru", "kvartira.ru",
+    "nedvizhimost.ru", "realty.ru", "move.ru", "mirkvartir.ru",
+    "cian.ru", "domofond.ru", "yandex.realty", "etagi.com",
+    "m2.ru", "gdeetotdom.ru", "novostroy.su", "incom.ru",
+    "bn.ru", "snimi.ru", "rentflot.ru", "kvartus.ru",
 }
 
-# Слова в title, которые указывают на агрегатор/рейтинг
+# Слова в title, которые указывают на агрегатор/рейтинг/список
 SKIP_TITLE_WORDS = [
     "топ-", "топ ", "рейтинг", "адреса", "телефоны", "отзывы",
     "справочник", "каталог", "портал", "обзор", "сравнение",
     "где найти", "как выбрать", "лучшие", "подборка",
+    "список", "застройщики", "организации", "компании",
+    "строительные", "застройщиков", "новостройки",
+    "квартиры", "недвижимость", "продажа",
+    "сайты", "все ", "полный список", "перечень",
+    "карта", "фото", "цены", "подмосковья",
 ]
 
 # Технические email-паттерны
 JUNK_EMAIL_PATTERNS = [
-    r"^[a-f0-9]{20,}@",  # хеши типа 90be38a2820071f4263db07d0a07cab8@
-    r"^u002[fF]@",        # u002F@
-    r"sentry",            # sentry
-    r"gravatar",          # gravatar
-    r"amazonaws",         # aws
-    r"cloudfront",        # cloudfront
-    r"heroku",            # heroku
-    r"firebase",          # firebase
+    r"^[a-f0-9]{20,}@",
+    r"^u002[fF]@",
+    r"sentry",
+    r"gravatar",
+    r"amazonaws",
+    r"cloudfront",
+    r"heroku",
+    r"firebase",
+    r"^[0-9a-f]{8,}@",
 ]
 
 
 def extract_emails(text: str) -> list:
     if not text:
         return []
-    return list(set(EMAIL_REGEX.findall(text)))
+    emails = EMAIL_REGEX.findall(text)
+    # Убираем лишние точки в начале
+    cleaned = []
+    for e in emails:
+        e = e.strip()
+        while e.startswith("."):
+            e = e[1:]
+        if "@" in e and "." in e.split("@")[1]:
+            cleaned.append(e)
+    return list(set(cleaned))
 
 
 def fetch_url(url: str, retries: int = 2) -> str | None:
@@ -131,15 +151,11 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
 
 def is_junk_email(email: str) -> bool:
     lower = email.lower()
-    
-    # Технические паттерны
     for pattern in JUNK_EMAIL_PATTERNS:
         if re.search(pattern, lower):
             return True
-    
     junk_domains = ["example.com", "test.com", "domain.com", "email.com", "yourdomain.com", "localhost", "site.com", "company.com"]
     junk_prefixes = ["no-reply", "noreply", "donotreply", "robot", "autoreply", "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster", "postmaster", "webmaster", "root", "administrator", "security", "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@"]
-    
     if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
         return True
     if any(lower.startswith(p) for p in junk_prefixes):
@@ -165,7 +181,6 @@ def classify_email(email: str) -> str:
 
 
 def is_aggregator_title(title: str) -> bool:
-    """Проверяет, является ли title агрегатором/рейтингом."""
     lower = title.lower()
     for word in SKIP_TITLE_WORDS:
         if word in lower:
@@ -242,6 +257,28 @@ def search_emails_for_domain(domain: str) -> dict:
     return result
 
 
+def clean_title(title: str) -> str:
+    """Очищает title от мусора."""
+    # Убираем суффиксы
+    suffixes = [
+        " — Яндекс", " | Яндекс", " - Google", " | Google",
+        " | ВКонтакте", " — ВКонтакте", " | Facebook",
+        " | Instagram", " | Twitter", " | LinkedIn",
+        " - YouTube", " | YouTube", " | Telegram",
+        " - официальный сайт", " | официальный сайт",
+        " – официальный сайт", " — официальный сайт",
+    ]
+    for suffix in suffixes:
+        if suffix in title:
+            title = title.split(suffix)[0].strip()
+    
+    # Убираем многоточие и лишние пробелы
+    title = title.replace("...", "").replace("…", "").strip()
+    title = re.sub(r'\s+', ' ', title)
+    
+    return title
+
+
 def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
     companies = []
     seen_domains = set()
@@ -277,12 +314,13 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         if skip:
                             continue
                         
-                        # Пропускаем слишком длинные домены (обычно агрегаторы)
+                        # Пропускаем слишком длинные домены
                         if len(domain) > 40:
                             continue
                         
                         # Пропускаем поддомены агрегаторов
-                        if any(d in domain for d in ["sprav", "rating", "top", "catalog", "portal", "review"]):
+                        bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "catalog", "directory"]
+                        if any(w in domain for w in bad_words):
                             continue
                         
                         if domain in seen_domains:
@@ -292,15 +330,14 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                             continue
                         
                         seen_domains.add(domain)
+                        clean = clean_title(title)
                         
-                        # Очищаем title
-                        clean_title = title
-                        # Убираем лишнее из title
-                        for suffix in [" — Яндекс", " | Яндекс", " - Google", " | Google", " | ВКонтакте", " — ВКонтакте"]:
-                            clean_title = clean_title.split(suffix)[0].strip()
+                        # Повторная проверка после очистки
+                        if is_aggregator_title(clean):
+                            continue
                         
                         companies.append({
-                            "name": clean_title,
+                            "name": clean,
                             "domain": domain,
                             "url": href,
                         })
