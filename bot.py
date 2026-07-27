@@ -1,13 +1,11 @@
 import asyncio
 import os
 import re
-import smtplib
+import sqlite3
 import sys
 import time
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from urllib.parse import urljoin, urlparse
+from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 import whois
@@ -20,13 +18,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 
-# Храним путь к резюме (загружается один раз)
-RESUME_PATH = "resume.pdf"
+# === БАЗА ДАННЫХ ===
+DB_PATH = "companies.db"
 
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS shown_domains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            domain TEXT NOT NULL,
+            shown_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, domain)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def is_domain_shown(user_id: int, domain: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM shown_domains WHERE user_id = ? AND domain = ?", (user_id, domain))
+    result = c.fetchone() is not None
+    conn.close()
+    return result
+
+def mark_domain_shown(user_id: int, domain: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO shown_domains (user_id, domain) VALUES (?, ?)", (user_id, domain))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # Уже есть
+    conn.close()
+
+init_db()
+
+# === ПОИСК EMAIL ===
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
@@ -36,22 +67,17 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-CONTACT_KEYWORDS = [
-    "contact", "contacts", "kontakt", "kontakty", "kontakti",
-    "about", "o-kompanii", "o-nas", "company", "about-us",
-    "company/contacts", "company/contact", "about/contacts",
-    "en/contacts", "ru/contacts", "contacts.html", "contact.html",
-]
-
-VACANCY_KEYWORDS = [
-    "vacancies", "vacancy", "career", "careers", "jobs", "job",
-    "hr", "human-resources", "recruitment", "recruiting", "talent",
-    "join", "join-us", "team", "rabota", "vakansii",
-]
-
-OTHER_KEYWORDS = [
-    "press", "media", "pr", "news", "investors", "partners",
-]
+SKIP_DOMAINS = {
+    "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
+    "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
+    "wikipedia.org", "news.ru", "ria.ru", "tass.ru", "lenta.ru",
+    "cian.ru", "domclick.ru", "irr.ru", "pulscen.ru", "blizko.ru",
+    "zoon.ru", "yell.ru", "2gis.ru", "orgpage.ru", "kontur.ru",
+    "banki.ru", "sravni.ru", "otzovik.com", "profi.ru",
+    "vseinstrumenti.ru", "wildberries.ru", "ozon.ru",
+    "market.yandex.ru", "aliexpress.ru", "sberbank.ru", "tinkoff.ru",
+    "vtb.ru", "gazprombank.ru", "alfabank.ru", "raiffeisen.ru",
+}
 
 
 def extract_emails(text: str) -> list:
@@ -80,20 +106,6 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
     return None
 
 
-def find_links_by_keywords(base_url: str, html: str, keywords: list) -> list:
-    if not html or html == "BLOCKED":
-        return []
-    links = set()
-    hrefs = HREF_REGEX.findall(html)
-    for href in hrefs:
-        href_lower = href.lower()
-        if any(k in href_lower for k in keywords):
-            full_url = urljoin(base_url, href)
-            if urlparse(full_url).netloc.replace("www.", "") == urlparse(base_url).netloc.replace("www.", ""):
-                links.add(full_url)
-    return list(links)
-
-
 def classify_email(email: str) -> str:
     lower = email.lower()
     hr_patterns = ["hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@", "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@", "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@", "hr.", "career.", "recruit.", "job.", "vacancy.", "work."]
@@ -101,14 +113,14 @@ def classify_email(email: str) -> str:
     sales_patterns = ["sales@", "marketing@", "bizdev@", "business@", "commercial@", "commerce@", "trade@", "dealer@", "distrib@", "partner@", "b2b@", "client@", "customers@", "zakaz@", "prodaza@", "zakupki@"]
     general_patterns = ["info@", "office@", "contact@", "contacts@", "support@", "admin@", "help@", "service@", "reception@", "general@", "mail@", "post@", "press@", "media@", "pr@", "secretary@", "secretariat@"]
     if any(p in lower for p in hr_patterns):
-        return "👤 HR / Найм"
+        return "HR / Найм"
     if any(p in lower for p in leadership_patterns):
-        return "👔 Руководство"
+        return "Руководство"
     if any(p in lower for p in sales_patterns):
-        return "💼 Продажи / Бизнес"
+        return "Продажи / Бизнес"
     if any(p in lower for p in general_patterns):
-        return "🏢 Общий"
-    return "❓ Другой"
+        return "Общий"
+    return "Другой"
 
 
 def is_junk_email(email: str) -> bool:
@@ -120,30 +132,6 @@ def is_junk_email(email: str) -> bool:
     if any(lower.startswith(p) for p in junk_prefixes):
         return True
     return False
-
-
-def search_email_in_html(html: str) -> list:
-    emails = extract_emails(html)
-    obf1 = re.findall(r'([a-zA-Z0-9._%+-]+)\s*\[at\]\s*([a-zA-Z0-9.-]+)\s*\[dot\]\s*([a-zA-Z]{2,})', html)
-    for m in obf1:
-        emails.append(f"{m[0]}@{m[1]}.{m[2]}")
-    obf2 = re.findall(r'([a-zA-Z0-9._%+-]+)\(at\)([a-zA-Z0-9.-]+)\(dot\)([a-zA-Z]{2,})', html)
-    for m in obf2:
-        emails.append(f"{m[0]}@{m[1]}.{m[2]}")
-    return list(set(emails))
-
-
-def get_whois_emails(domain: str) -> list:
-    try:
-        w = whois.whois(domain)
-        emails = w.email
-        if isinstance(emails, str):
-            return [emails]
-        elif isinstance(emails, list):
-            return [e for e in emails if e and "@" in str(e)]
-    except Exception:
-        pass
-    return []
 
 
 def search_emails_ddg(domain: str) -> list:
@@ -172,94 +160,132 @@ def search_emails_ddg(domain: str) -> list:
     return list(emails)
 
 
-async def search_emails(url: str) -> dict:
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    result = {"emails": {}, "blocked": False, "pages_checked": []}
-    domain = urlparse(url).netloc.replace("www.", "")
-    
+def search_emails_for_domain(domain: str) -> dict:
+    result = {"emails": {}, "blocked": False}
     ddg_emails = search_emails_ddg(domain)
     for email in ddg_emails:
         if not is_junk_email(email):
             if email not in result["emails"]:
                 result["emails"][email] = {"type": classify_email(email), "sources": []}
-            if "DuckDuckGo поиск" not in result["emails"][email]["sources"]:
-                result["emails"][email]["sources"].append("DuckDuckGo поиск")
+            if "DuckDuckGo" not in result["emails"][email]["sources"]:
+                result["emails"][email]["sources"].append("DuckDuckGo")
     
+    url = f"https://{domain}"
     html = fetch_url(url)
     if html == "BLOCKED":
         result["blocked"] = True
     elif html:
-        result["pages_checked"].append("Главная страница")
-        for email in search_email_in_html(html):
+        for email in extract_emails(html):
             if not is_junk_email(email):
                 if email not in result["emails"]:
                     result["emails"][email] = {"type": classify_email(email), "sources": []}
-                if "Главная страница" not in result["emails"][email]["sources"]:
-                    result["emails"][email]["sources"].append("Главная страница")
-        
-        contact_links = find_links_by_keywords(url, html, CONTACT_KEYWORDS)
-        for link in contact_links[:3]:
-            contact_html = fetch_url(link)
-            if contact_html and contact_html != "BLOCKED":
-                for email in search_email_in_html(contact_html):
-                    if not is_junk_email(email):
-                        if email not in result["emails"]:
-                            result["emails"][email] = {"type": classify_email(email), "sources": []}
-                        if "Контакты" not in result["emails"][email]["sources"]:
-                            result["emails"][email]["sources"].append("Контакты")
-        
-        vacancy_links = find_links_by_keywords(url, html, VACANCY_KEYWORDS)
-        for link in vacancy_links[:3]:
-            vacancy_html = fetch_url(link)
-            if vacancy_html and vacancy_html != "BLOCKED":
-                for email in search_email_in_html(vacancy_html):
-                    if not is_junk_email(email):
-                        if email not in result["emails"]:
-                            result["emails"][email] = {"type": classify_email(email), "sources": []}
-                        if "Вакансии / Карьера" not in result["emails"][email]["sources"]:
-                            result["emails"][email]["sources"].append("Вакансии / Карьера")
+                if "Сайт" not in result["emails"][email]["sources"]:
+                    result["emails"][email]["sources"].append("Сайт")
     
-    whois_emails = get_whois_emails(domain)
-    for email in whois_emails:
-        if not is_junk_email(email):
-            if email not in result["emails"]:
-                result["emails"][email] = {"type": classify_email(email), "sources": []}
-            if "WHOIS домена" not in result["emails"][email]["sources"]:
-                result["emails"][email]["sources"].append("WHOIS домена")
+    try:
+        w = whois.whois(domain)
+        whois_emails = w.email
+        if isinstance(whois_emails, str):
+            whois_emails = [whois_emails]
+        elif isinstance(whois_emails, list):
+            whois_emails = [e for e in whois_emails if e and "@" in str(e)]
+        else:
+            whois_emails = []
+        for email in whois_emails:
+            if not is_junk_email(email):
+                if email not in result["emails"]:
+                    result["emails"][email] = {"type": classify_email(email), "sources": []}
+                if "WHOIS" not in result["emails"][email]["sources"]:
+                    result["emails"][email]["sources"].append("WHOIS")
+    except Exception:
+        pass
     
     return result
 
 
-def send_email(to_email: str, subject: str, body: str, attachment_path: str | None = None) -> str:
-    """Отправляет email через SMTP."""
-    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-        return "❌ SMTP не настроен. Проверь переменные EMAIL_ADDRESS и EMAIL_PASSWORD."
+def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
+    companies = []
+    seen_domains = set()
+    
+    search_queries = [
+        f'{query} официальный сайт',
+        f'{query} контакты',
+    ]
     
     try:
-        msg = MIMEMultipart()
-        msg["From"] = EMAIL_ADDRESS
-        msg["To"] = to_email
-        msg["Subject"] = subject
+        with DDGS() as ddgs:
+            for sq in search_queries:
+                try:
+                    results = list(ddgs.text(sq, max_results=20))
+                    for r in results:
+                        href = r.get("href", "")
+                        if not href:
+                            continue
+                        
+                        parsed = urlparse(href)
+                        domain = parsed.netloc.replace("www.", "").lower()
+                        
+                        if not domain:
+                            continue
+                        skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
+                        if skip:
+                            continue
+                        if domain in seen_domains:
+                            continue
+                        # Проверяем, не показывали ли уже пользователю
+                        if is_domain_shown(user_id, domain):
+                            continue
+                        
+                        seen_domains.add(domain)
+                        title = r.get("title", domain).strip()
+                        
+                        companies.append({
+                            "name": title,
+                            "domain": domain,
+                            "url": href,
+                        })
+                        
+                        if len(companies) >= limit:
+                            break
+                except Exception:
+                    continue
+                
+                if len(companies) >= limit:
+                    break
+    except Exception:
+        pass
+    
+    return companies
+
+
+def format_company_text(idx: int, company: dict) -> str:
+    """Форматирует одну компанию в текст."""
+    name = company.get("name", "—")
+    domain = company.get("domain", "—")
+    emails = company.get("emails", {})
+    
+    lines = [f"{idx}. {name}"]
+    lines.append(f"   🌐 {domain}")
+    
+    if not emails:
+        lines.append("   📧 Email не найден")
+    else:
+        # Группируем по типу
+        by_type = {}
+        for email, data in emails.items():
+            t = data.get("type", "Другой")
+            if t not in by_type:
+                by_type[t] = []
+            by_type[t].append(email)
         
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        
-        if attachment_path and os.path.exists(attachment_path):
-            with open(attachment_path, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
-            part["Content-Disposition"] = f'attachment; filename="{os.path.basename(attachment_path)}"'
-            msg.attach(part)
-        
-        server = smtplib.SMTP_SSL(SMTP_SERVER, 465)
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
-        server.quit()
-        
-        return f"✅ Письмо отправлено на {to_email}"
-    except smtplib.SMTPAuthenticationError:
-        return "❌ Ошибка авторизации SMTP. Проверь EMAIL_ADDRESS и EMAIL_PASSWORD (должен быть App Password, не обычный пароль Gmail)."
-    except Exception as e:
-        return f"❌ Ошибка отправки: {e}"
+        type_order = ["HR / Найм", "Руководство", "Продажи / Бизнес", "Общий", "Другой"]
+        for t in type_order:
+            if t in by_type:
+                for email in by_type[t]:
+                    lines.append(f"   📧 {email} ({t})")
+    
+    lines.append("")  # Пустая строка между компаниями
+    return "\n".join(lines)
 
 
 async def main() -> None:
@@ -273,78 +299,104 @@ async def main() -> None:
     @dp.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         await message.answer(
-            "Привет! Я помогаю находить контакты компаний и отправлять резюме.\n\n"
+            "Привет! Я ищу email-адреса компаний.\n\n"
             "Команды:\n"
             "• Отправь сайт (например: omk.ru) — найду email\n"
-            "• Отправь PDF с резюме — сохраню для рассылки\n"
-            "• /send email@company.ru Текст — отправлю резюме\n\n"
-            "Пример:\n"
-            "/send info@omk.ru Здравствуйте! Предлагаю свою кандидатуру на позицию коммерческого директора."
+            "• /find <запрос> — найду компании и их email\n"
+            "• /reset — сбросить историю (чтобы снова видеть ранее показанные компании)\n\n"
+            "Примеры:\n"
+            "/find строительные компании Москва\n"
+            "/find IT аутсорсинг Санкт-Петербург\n"
+            "/find производство труб"
         )
 
-    @dp.message(F.document)
-    async def handle_document(message: Message) -> None:
-        """Обрабатывает загрузку PDF резюме."""
-        if not message.document:
-            await message.answer("Отправь файл PDF.")
-            return
-        
-        doc = message.document
-        if not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
-            await message.answer("Пожалуйста, отправь файл в формате PDF.")
-            return
-        
-        await message.answer("⏳ Загружаю резюме...")
-        
-        try:
-            file = await bot.get_file(doc.file_id)
-            await bot.download_file(file.file_path, RESUME_PATH)
-            await message.answer(
-                f"✅ Резюме сохранено: {doc.file_name}\n\n"
-                f"Теперь можешь отправить команду:\n"
-                f"/send email@company.ru Текст письма"
-            )
-        except Exception as e:
-            await message.answer(f"❌ Ошибка загрузки: {e}")
+    @dp.message(Command("reset"))
+    async def cmd_reset(message: Message) -> None:
+        """Сбрасывает историю показанных компаний для пользователя."""
+        user_id = message.from_user.id
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM shown_domains WHERE user_id = ?", (user_id,))
+        conn.commit()
+        deleted = c.rowcount
+        conn.close()
+        await message.answer(f"🗑 История сброшена. Удалено {deleted} записей.\nТеперь /find будет показывать все компании заново.")
 
-    @dp.message(Command("send"))
-    async def cmd_send(message: Message) -> None:
-        """Отправляет резюме на указанный email."""
-        if not os.path.exists(RESUME_PATH):
+    @dp.message(Command("find"))
+    async def cmd_find(message: Message) -> None:
+        query = message.text.replace("/find", "").strip()
+        if not query:
             await message.answer(
-                "❌ Резюме не загружено.\n\n"
-                "Сначала отправь мне PDF с резюме, потом используй /send."
+                "Отправь запрос после /find\n\n"
+                "Примеры:\n"
+                "/find строительные компании Москва\n"
+                "/find IT аутсорсинг СПб\n"
+                "/find производство металла"
             )
             return
         
-        # Формат: /send email@company.ru Текст письма
-        args = message.text.replace("/send", "").strip()
-        if not args:
-            await message.answer(
-                "Использование:\n"
-                "/send email@company.ru Здравствуйте, хочу предложить свою кандидатуру..."
-            )
+        user_id = message.from_user.id
+        await message.answer(f"🔍 Ищу компании: «{query}»\nЭто займёт 1–2 минуты...")
+        
+        # Ищем компании
+        companies = find_companies_ddg(query, user_id, limit=10)
+        
+        if not companies:
+            await message.answer("😕 Компании не найдены. Попробуй другой запрос.")
             return
         
-        parts = args.split(" ", 1)
-        if len(parts) < 1 or "@" not in parts[0]:
-            await message.answer(
-                "❌ Неверный формат.\n\n"
-                "Пример:\n"
-                "/send info@omk.ru Здравствуйте! Предлагаю свою кандидатуру."
-            )
-            return
+        await message.answer(f"📋 Найдено {len(companies)} новых компаний. Ищу email...")
         
-        to_email = parts[0].strip()
-        body = parts[1].strip() if len(parts) > 1 else "Добрый день! Предлагаю Вашему вниманию моё резюме."
+        # Ищем email для каждой компании
+        companies_with_emails = []
+        for comp in companies:
+            domain = comp["domain"]
+            result = search_emails_for_domain(domain)
+            comp["emails"] = result["emails"]
+            comp["blocked"] = result["blocked"]
+            companies_with_emails.append(comp)
+            mark_domain_shown(user_id, domain)
+            await asyncio.sleep(1)
         
-        # Формируем тему
-        subject = f"Резюме — {EMAIL_ADDRESS.split('@')[0] if EMAIL_ADDRESS else 'Кандидат'}"
+        # Считаем статистику
+        total_emails = sum(len(c["emails"]) for c in companies_with_emails)
+        companies_with_email = sum(1 for c in companies_with_emails if c["emails"])
         
-        await message.answer(f"⏳ Отправляю резюме на {to_email}...")
+        # Формируем заголовок
+        header = (
+            f"✅ Результаты поиска: «{query}»\n\n"
+            f"• Компаний: {len(companies_with_emails)}\n"
+            f"• С email: {companies_with_email}\n"
+            f"• Всего email: {total_emails}\n\n"
+        )
         
-        result = send_email(to_email, subject, body, RESUME_PATH)
-        await message.answer(result)
+        # Разбиваем на сообщения (лимит 4096 символов)
+        messages = []
+        current_msg = header
+        current_len = len(header)
+        
+        for i, comp in enumerate(companies_with_emails, 1):
+            block = format_company_text(i, comp)
+            if current_len + len(block) > 3800:
+                messages.append(current_msg)
+                current_msg = block
+                current_len = len(block)
+            else:
+                current_msg += block
+                current_len += len(block)
+        
+        if current_msg:
+            messages.append(current_msg)
+        
+        # Отправляем сообщения
+        for msg in messages:
+            await message.answer(msg)
+        
+        await message.answer(
+            "✅ Готово!\n\n"
+            "Чтобы найти ещё компании по этой же теме — отправь /find снова.\n"
+            "Чтобы сбросить историю (увидеть все компании заново) — /reset"
+        )
 
     @dp.message(F.text)
     async def handle_text(message: Message) -> None:
@@ -353,18 +405,14 @@ async def main() -> None:
         if "." not in url or " " in url:
             await message.answer(
                 "Отправь сайт компании (например: omk.ru)\n"
-                "Или используй /send для отправки резюме"
+                "Или используй /find для поиска компаний"
             )
             return
         
         await message.answer(f"🔍 Ищу email на {url}...")
         
-        try:
-            result = await search_emails(url)
-        except Exception as e:
-            await message.answer(f"❌ Ошибка при поиске: {e}")
-            return
-        
+        domain = url.replace("https://", "").replace("http://", "").split("/")[0].replace("www.", "")
+        result = search_emails_for_domain(domain)
         emails_data = result.get("emails", {})
         
         if not emails_data:
@@ -385,7 +433,7 @@ async def main() -> None:
             by_type[t].append((email, data["sources"]))
         
         text = f"📧 Найдено {len(emails_data)} email(ов) для {url}:\n\n"
-        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой"]
+        type_order = ["HR / Найм", "Руководство", "Продажи / Бизнес", "Общий", "Другой"]
         
         for t in type_order:
             if t in by_type:
@@ -395,7 +443,7 @@ async def main() -> None:
                     text += f"    Источник: {', '.join(sources)}\n"
                 text += "\n"
         
-        text += "✅ Готово! Чтобы отправить резюме:\n/send email@company.ru Текст письма"
+        text += "✅ Готово! Выбирай подходящий email."
         await message.answer(text)
 
     print("Бот запущен...")
