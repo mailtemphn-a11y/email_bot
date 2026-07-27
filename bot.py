@@ -55,7 +55,6 @@ def mark_domain_shown(user_id: int, domain: str):
 
 init_db()
 
-# Улучшенная regex — email должен заканчиваться на буквы, не на картинку
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}\b")
 HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
@@ -65,7 +64,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Агрегаторы, соцсети, госорганы, СРО
+# Агрегаторы, соцсети, госорганы
 SKIP_DOMAINS = {
     "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
@@ -87,14 +86,20 @@ SKIP_DOMAINS = {
     "domofond.ru", "yandex.realty", "etagi.com",
     "m2.ru", "gdeetotdom.ru", "novostroy.su", "incom.ru",
     "bn.ru", "snimi.ru", "rentflot.ru", "kvartus.ru",
-    # Соцсети
     "vk.com", "m.vk.com", "t.me", "telegram.org", "facebook.com",
     "instagram.com", "twitter.com", "x.com", "linkedin.com",
-    # Госорганы
     "mos.ru", "gov.ru", "garant.ru", "consultant.ru",
-    # СРО
-    "sro", "npmaap.ru", "sro-apoek.ru", "sroaap.ru", "sroaas.ru",
+    "npmaap.ru", "sro-apoek.ru", "sroaap.ru", "sroaas.ru",
     "sroo.ru", "sro-soyuz.ru", "np-sro.ru", "sro-rf.ru",
+}
+
+# Личные почтовые сервисы (не корпоративные)
+PERSONAL_EMAIL_DOMAINS = {
+    "mail.ru", "bk.ru", "list.ru", "inbox.ru", "internet.ru",
+    "yandex.ru", "ya.ru", "yandex.com", "gmail.com", "googlemail.com",
+    "hotmail.com", "outlook.com", "live.com", "icloud.com",
+    "me.com", "mac.com", "rambler.ru", "lenta.ru", "autorambler.ru",
+    "myrambler.ru", "ro.ru", "163.com", "qq.com",
 }
 
 # Слова в title — агрегаторы, СРО, госорганы
@@ -111,9 +116,10 @@ SKIP_TITLE_WORDS = [
     "префектура", "административный округ", "округа",
     "правительство", "министерство", "государственн", "муниципал",
     "главная", "вконтакте", "vk", "facebook", "instagram",
+    "департамент", "федеральн", "агентство", "комитет",
+    "цена", "прайс", "стоимость", "под ключ", "подбор",
 ]
 
-# Технические email-паттерны
 JUNK_EMAIL_PATTERNS = [
     r"^[a-f0-9]{20,}@",
     r"^u002[fF]@",
@@ -131,11 +137,17 @@ JUNK_EMAIL_PATTERNS = [
     r"avatar@",
 ]
 
-# Мусорные email
 JUNK_EMAILS = {
     "example@example.ru", "example@example.com", "test@test.com",
-    "admin@admin.ru", "user@user.ru", "info@info.ru",
+    "admin@admin.ru", "user@user.ru", "info@info.ru", "info@mail.ru",
 }
+
+
+def is_personal_email(email: str) -> bool:
+    """Проверяет, является ли email личным (не корпоративным)."""
+    lower = email.lower()
+    domain = lower.split("@")[-1]
+    return domain in PERSONAL_EMAIL_DOMAINS
 
 
 def extract_emails(text: str) -> list:
@@ -145,20 +157,16 @@ def extract_emails(text: str) -> list:
     cleaned = []
     for e in emails:
         e = e.strip().lower()
-        # Убираем точки в начале
         while e.startswith("."):
             e = e[1:]
-        # Проверяем что это реальный email
         if "@" not in e:
             continue
         parts = e.split("@")
         if len(parts) != 2:
             continue
         domain_part = parts[1]
-        # Не должен заканчиваться на картинку
         if domain_part.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")):
             continue
-        # Не должен содержать слеши
         if "/" in e:
             continue
         cleaned.append(e)
@@ -187,19 +195,13 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
 
 def is_junk_email(email: str) -> bool:
     lower = email.lower()
-    
-    # Точные совпадения
     if lower in JUNK_EMAILS:
         return True
-    
-    # Паттерны
     for pattern in JUNK_EMAIL_PATTERNS:
         if re.search(pattern, lower):
             return True
-    
     junk_domains = ["example.com", "test.com", "domain.com", "email.com", "yourdomain.com", "localhost", "site.com", "company.com"]
     junk_prefixes = ["no-reply", "noreply", "donotreply", "robot", "autoreply", "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster", "postmaster", "webmaster", "root", "administrator", "security", "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@"]
-    
     if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
         return True
     if any(lower.startswith(p) for p in junk_prefixes):
@@ -209,19 +211,21 @@ def is_junk_email(email: str) -> bool:
 
 def classify_email(email: str) -> str:
     lower = email.lower()
+    if is_personal_email(email):
+        return "⚠️ Личный ящик"
     hr_patterns = ["hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@", "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@", "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@", "hr.", "career.", "recruit.", "job.", "vacancy.", "work."]
     leadership_patterns = ["ceo@", "director@", "chief@", "president@", "manager@", "head@", "founder@", "owner@", "md@", "dir@", "managing@", "executive@", "lead@", "boss@", "supervisor@", "руководство@", "директор@", "гендиректор@", "prezes@", "direktor@", "leiter@"]
     sales_patterns = ["sales@", "marketing@", "bizdev@", "business@", "commercial@", "commerce@", "trade@", "dealer@", "distrib@", "partner@", "b2b@", "client@", "customers@", "zakaz@", "prodaza@", "zakupki@"]
     general_patterns = ["info@", "office@", "contact@", "contacts@", "support@", "admin@", "help@", "service@", "reception@", "general@", "mail@", "post@", "press@", "media@", "pr@", "secretary@", "secretariat@"]
     if any(p in lower for p in hr_patterns):
-        return "HR / Найм"
+        return "👤 HR / Найм"
     if any(p in lower for p in leadership_patterns):
-        return "Руководство"
+        return "👔 Руководство"
     if any(p in lower for p in sales_patterns):
-        return "Продажи / Бизнес"
+        return "💼 Продажи / Бизнес"
     if any(p in lower for p in general_patterns):
-        return "Общий"
-    return "Другой"
+        return "🏢 Общий"
+    return "❓ Другой"
 
 
 def is_aggregator_title(title: str) -> bool:
@@ -315,22 +319,18 @@ def clean_title(title: str) -> str:
     for suffix in suffixes:
         if suffix in title:
             title = title.split(suffix)[0].strip()
-    
     title = title.replace("...", "").replace("…", "").strip()
     title = re.sub(r'\s+', ' ', title)
-    
     return title
 
 
 def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
     companies = []
     seen_domains = set()
-    
     search_queries = [
         f'{query} официальный сайт',
         f'{query}',
     ]
-    
     try:
         with DDGS() as ddgs:
             for sq in search_queries:
@@ -341,64 +341,44 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         title = r.get("title", "").strip()
                         if not href or not title:
                             continue
-                        
                         if is_aggregator_title(title):
                             continue
-                        
                         parsed = urlparse(href)
                         domain = parsed.netloc.replace("www.", "").lower()
-                        
                         if not domain:
                             continue
-                        
-                        # Пропускаем мусорные домены
                         skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
                         if skip:
                             continue
-                        
-                        # Пропускаем госдомены (кроме известных компаний)
                         if any(domain.endswith(g) for g in [".gov.ru", ".gov", ".mil", ".mos.ru", ".spb.ru"]):
-                            # Разрешаем mosproject.ru, но не sao.mos.ru
                             if "mosproject" not in domain and "project" not in domain:
                                 continue
-                        
-                        # Пропускаем слишком длинные домены
                         if len(domain) > 40:
                             continue
-                        
-                        # Пропускаем поддомены агрегаторов
                         bad_words = ["sprav", "rating", "top", "catalog", "portal", "review", "list", "directory", "sro", "np-"]
                         if any(w in domain for w in bad_words):
                             continue
-                        
                         if domain in seen_domains:
                             continue
-                        
                         if is_domain_shown(user_id, domain):
                             continue
-                        
                         seen_domains.add(domain)
                         clean = clean_title(title)
-                        
                         if is_aggregator_title(clean):
                             continue
-                        
                         companies.append({
                             "name": clean,
                             "domain": domain,
                             "url": href,
                         })
-                        
                         if len(companies) >= limit:
                             break
                 except Exception:
                     continue
-                
                 if len(companies) >= limit:
                     break
     except Exception:
         pass
-    
     return companies
 
 
@@ -420,7 +400,7 @@ def format_company_text(idx: int, company: dict) -> str:
                 by_type[t] = []
             by_type[t].append(email)
         
-        type_order = ["HR / Найм", "Руководство", "Продажи / Бизнес", "Общий", "Другой"]
+        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой", "⚠️ Личный ящик"]
         for t in type_order:
             if t in by_type:
                 for email in by_type[t]:
@@ -446,10 +426,12 @@ async def main() -> None:
             "• Отправь сайт (например: omk.ru) — найду email\n"
             "• /find <запрос> — найду компании и их email\n"
             "• /reset — сбросить историю\n\n"
+            "Email помечаются:\n"
+            "👤 HR / 👔 Руководство / 💼 Продажи / 🏢 Общий\n"
+            "⚠️ Личный ящик — на mail.ru, yandex.ru (меньше шансов ответа)\n\n"
             "Примеры:\n"
             "/find строительные компании Москва\n"
-            "/find IT аутсорсинг Санкт-Петербург\n"
-            "/find производство труб"
+            "/find IT аутсорсинг Санкт-Петербург"
         )
 
     @dp.message(Command("reset"))
@@ -568,7 +550,7 @@ async def main() -> None:
             by_type[t].append((email, data["sources"]))
         
         text = f"📧 Найдено {len(emails_data)} email(ов) для {url}:\n\n"
-        type_order = ["HR / Найм", "Руководство", "Продажи / Бизнес", "Общий", "Другой"]
+        type_order = ["👤 HR / Найм", "👔 Руководство", "💼 Продажи / Бизнес", "🏢 Общий", "❓ Другой", "⚠️ Личный ящик"]
         
         for t in type_order:
             if t in by_type:
