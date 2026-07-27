@@ -4,7 +4,6 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
@@ -19,7 +18,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# === БАЗА ДАННЫХ ===
 DB_PATH = "companies.db"
 
 def init_db():
@@ -52,12 +50,11 @@ def mark_domain_shown(user_id: int, domain: str):
         c.execute("INSERT INTO shown_domains (user_id, domain) VALUES (?, ?)", (user_id, domain))
         conn.commit()
     except sqlite3.IntegrityError:
-        pass  # Уже есть
+        pass
     conn.close()
 
 init_db()
 
-# === ПОИСК EMAIL ===
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 HREF_REGEX = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
@@ -67,6 +64,7 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+# Агрегаторы и мусорные домены
 SKIP_DOMAINS = {
     "hh.ru", "avito.ru", "yandex.ru", "google.com", "youtube.com",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com",
@@ -77,7 +75,32 @@ SKIP_DOMAINS = {
     "vseinstrumenti.ru", "wildberries.ru", "ozon.ru",
     "market.yandex.ru", "aliexpress.ru", "sberbank.ru", "tinkoff.ru",
     "vtb.ru", "gazprombank.ru", "alfabank.ru", "raiffeisen.ru",
+    # Агрегаторы компаний
+    "jsprav.ru", "spravker.ru", "spravochnik.ru", "org.ru",
+    "stroikompanies.ru", "kronotech.ru", "stroykontrol.info",
+    "vse-stroyka.ru", "vse-otzivi.ru", "zoon.ru", "yell.ru",
+    "top100.rambler.ru", "rating.ru", "rate.ru", "otzovik.com",
+    "irecommend.ru", "yandex.maps", "maps.yandex.ru",
 }
+
+# Слова в title, которые указывают на агрегатор/рейтинг
+SKIP_TITLE_WORDS = [
+    "топ-", "топ ", "рейтинг", "адреса", "телефоны", "отзывы",
+    "справочник", "каталог", "портал", "обзор", "сравнение",
+    "где найти", "как выбрать", "лучшие", "подборка",
+]
+
+# Технические email-паттерны
+JUNK_EMAIL_PATTERNS = [
+    r"^[a-f0-9]{20,}@",  # хеши типа 90be38a2820071f4263db07d0a07cab8@
+    r"^u002[fF]@",        # u002F@
+    r"sentry",            # sentry
+    r"gravatar",          # gravatar
+    r"amazonaws",         # aws
+    r"cloudfront",        # cloudfront
+    r"heroku",            # heroku
+    r"firebase",          # firebase
+]
 
 
 def extract_emails(text: str) -> list:
@@ -106,6 +129,24 @@ def fetch_url(url: str, retries: int = 2) -> str | None:
     return None
 
 
+def is_junk_email(email: str) -> bool:
+    lower = email.lower()
+    
+    # Технические паттерны
+    for pattern in JUNK_EMAIL_PATTERNS:
+        if re.search(pattern, lower):
+            return True
+    
+    junk_domains = ["example.com", "test.com", "domain.com", "email.com", "yourdomain.com", "localhost", "site.com", "company.com"]
+    junk_prefixes = ["no-reply", "noreply", "donotreply", "robot", "autoreply", "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster", "postmaster", "webmaster", "root", "administrator", "security", "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@"]
+    
+    if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
+        return True
+    if any(lower.startswith(p) for p in junk_prefixes):
+        return True
+    return False
+
+
 def classify_email(email: str) -> str:
     lower = email.lower()
     hr_patterns = ["hr@", "career@", "careers@", "recruitment@", "recruiting@", "jobs@", "vacancy@", "vacancies@", "talent@", "staffing@", "personnel@", "rabota@", "kadry@", "job@", "apply@", "work@", "join@", "hiring@", "hr.", "career.", "recruit.", "job.", "vacancy.", "work."]
@@ -123,14 +164,12 @@ def classify_email(email: str) -> str:
     return "Другой"
 
 
-def is_junk_email(email: str) -> bool:
-    lower = email.lower()
-    junk_domains = ["example.com", "test.com", "domain.com", "email.com", "yourdomain.com", "localhost", "site.com", "company.com"]
-    junk_prefixes = ["no-reply", "noreply", "donotreply", "robot", "autoreply", "auto-reply", "bounce", "abuse", "dns-admin", "hostmaster", "postmaster", "webmaster", "root", "administrator", "security", "noc", "suporte", "daemon", "mailer-daemon", "list@", "newsletter@"]
-    if any(email.endswith("@" + d) or email.endswith("." + d) for d in junk_domains):
-        return True
-    if any(lower.startswith(p) for p in junk_prefixes):
-        return True
+def is_aggregator_title(title: str) -> bool:
+    """Проверяет, является ли title агрегатором/рейтингом."""
+    lower = title.lower()
+    for word in SKIP_TITLE_WORDS:
+        if word in lower:
+            return True
     return False
 
 
@@ -209,17 +248,22 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
     
     search_queries = [
         f'{query} официальный сайт',
-        f'{query} контакты',
+        f'{query}',
     ]
     
     try:
         with DDGS() as ddgs:
             for sq in search_queries:
                 try:
-                    results = list(ddgs.text(sq, max_results=20))
+                    results = list(ddgs.text(sq, max_results=25))
                     for r in results:
                         href = r.get("href", "")
-                        if not href:
+                        title = r.get("title", "").strip()
+                        if not href or not title:
+                            continue
+                        
+                        # Пропускаем агрегаторы по title
+                        if is_aggregator_title(title):
                             continue
                         
                         parsed = urlparse(href)
@@ -227,20 +271,36 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
                         
                         if not domain:
                             continue
+                        
+                        # Пропускаем мусорные домены
                         skip = any(domain.endswith("." + d) or domain == d for d in SKIP_DOMAINS)
                         if skip:
                             continue
+                        
+                        # Пропускаем слишком длинные домены (обычно агрегаторы)
+                        if len(domain) > 40:
+                            continue
+                        
+                        # Пропускаем поддомены агрегаторов
+                        if any(d in domain for d in ["sprav", "rating", "top", "catalog", "portal", "review"]):
+                            continue
+                        
                         if domain in seen_domains:
                             continue
-                        # Проверяем, не показывали ли уже пользователю
+                        
                         if is_domain_shown(user_id, domain):
                             continue
                         
                         seen_domains.add(domain)
-                        title = r.get("title", domain).strip()
+                        
+                        # Очищаем title
+                        clean_title = title
+                        # Убираем лишнее из title
+                        for suffix in [" — Яндекс", " | Яндекс", " - Google", " | Google", " | ВКонтакте", " — ВКонтакте"]:
+                            clean_title = clean_title.split(suffix)[0].strip()
                         
                         companies.append({
-                            "name": title,
+                            "name": clean_title,
                             "domain": domain,
                             "url": href,
                         })
@@ -259,7 +319,6 @@ def find_companies_ddg(query: str, user_id: int, limit: int = 10) -> list:
 
 
 def format_company_text(idx: int, company: dict) -> str:
-    """Форматирует одну компанию в текст."""
     name = company.get("name", "—")
     domain = company.get("domain", "—")
     emails = company.get("emails", {})
@@ -270,7 +329,6 @@ def format_company_text(idx: int, company: dict) -> str:
     if not emails:
         lines.append("   📧 Email не найден")
     else:
-        # Группируем по типу
         by_type = {}
         for email, data in emails.items():
             t = data.get("type", "Другой")
@@ -284,7 +342,7 @@ def format_company_text(idx: int, company: dict) -> str:
                 for email in by_type[t]:
                     lines.append(f"   📧 {email} ({t})")
     
-    lines.append("")  # Пустая строка между компаниями
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -303,7 +361,7 @@ async def main() -> None:
             "Команды:\n"
             "• Отправь сайт (например: omk.ru) — найду email\n"
             "• /find <запрос> — найду компании и их email\n"
-            "• /reset — сбросить историю (чтобы снова видеть ранее показанные компании)\n\n"
+            "• /reset — сбросить историю\n\n"
             "Примеры:\n"
             "/find строительные компании Москва\n"
             "/find IT аутсорсинг Санкт-Петербург\n"
@@ -312,7 +370,6 @@ async def main() -> None:
 
     @dp.message(Command("reset"))
     async def cmd_reset(message: Message) -> None:
-        """Сбрасывает историю показанных компаний для пользователя."""
         user_id = message.from_user.id
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -320,7 +377,7 @@ async def main() -> None:
         conn.commit()
         deleted = c.rowcount
         conn.close()
-        await message.answer(f"🗑 История сброшена. Удалено {deleted} записей.\nТеперь /find будет показывать все компании заново.")
+        await message.answer(f"🗑 История сброшена. Удалено {deleted} записей.")
 
     @dp.message(Command("find"))
     async def cmd_find(message: Message) -> None:
@@ -336,18 +393,16 @@ async def main() -> None:
             return
         
         user_id = message.from_user.id
-        await message.answer(f"🔍 Ищу компании: «{query}»\nЭто займёт 1–2 минуты...")
+        await message.answer(f"🔍 Ищу компании: «{query}»\nФильтрую агрегаторы...")
         
-        # Ищем компании
         companies = find_companies_ddg(query, user_id, limit=10)
         
         if not companies:
             await message.answer("😕 Компании не найдены. Попробуй другой запрос.")
             return
         
-        await message.answer(f"📋 Найдено {len(companies)} новых компаний. Ищу email...")
+        await message.answer(f"📋 Найдено {len(companies)} компаний. Ищу email...")
         
-        # Ищем email для каждой компании
         companies_with_emails = []
         for comp in companies:
             domain = comp["domain"]
@@ -358,11 +413,9 @@ async def main() -> None:
             mark_domain_shown(user_id, domain)
             await asyncio.sleep(1)
         
-        # Считаем статистику
         total_emails = sum(len(c["emails"]) for c in companies_with_emails)
         companies_with_email = sum(1 for c in companies_with_emails if c["emails"])
         
-        # Формируем заголовок
         header = (
             f"✅ Результаты поиска: «{query}»\n\n"
             f"• Компаний: {len(companies_with_emails)}\n"
@@ -370,7 +423,6 @@ async def main() -> None:
             f"• Всего email: {total_emails}\n\n"
         )
         
-        # Разбиваем на сообщения (лимит 4096 символов)
         messages = []
         current_msg = header
         current_len = len(header)
@@ -388,14 +440,13 @@ async def main() -> None:
         if current_msg:
             messages.append(current_msg)
         
-        # Отправляем сообщения
         for msg in messages:
             await message.answer(msg)
         
         await message.answer(
             "✅ Готово!\n\n"
-            "Чтобы найти ещё компании по этой же теме — отправь /find снова.\n"
-            "Чтобы сбросить историю (увидеть все компании заново) — /reset"
+            "Повтори /find для новых компаний.\n"
+            "/reset — сбросить историю."
         )
 
     @dp.message(F.text)
